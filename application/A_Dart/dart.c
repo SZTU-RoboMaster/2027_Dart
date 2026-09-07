@@ -186,12 +186,13 @@ Dart_Ready_Manage_t dart_ready_manage=
 
 /*      滤波      */
 first_order_filter_type_t filter_yaw_in;
+float trigger_distance_set[4] = {0, 0, 0, 0};
 void dart_task(void const*pvParameters)
 {
     vTaskDelay(DART_TASK_INIT_TIME);
     dart_init();//记得改
     turn_motor_init();
-    //dart_reset();
+    dart_reset();
     while(1)
     {
         dart_data_update();
@@ -341,30 +342,30 @@ static void dart_reset()
              launcher_dart.push_r_motor_reset();
              launcher_dart.push_motor_r.angle_p.set=-launcher_dart.reset_push_pos;
          }
-        if (!READ_L_TURN_PIN()&&!turndish_dart.reset_l_turn_flag)
-        {
-            turndish_dart.turn_l_motor.angle_p.set=0xff;
-            turndish_dart.turn_l_motor.speed_p.set = dart_init_speed.init_speed_turn;
-        }
-         if (READ_L_TURN_PIN()&&!turndish_dart.reset_l_turn_flag)
-         {
-             turndish_dart.reset_l_turn_flag = true;
-             turndish_dart.turn_l_motor_reset();
-             turndish_dart.turn_l_motor.angle_p.set = turndish_dart.reset_turn_pos;
-
-         }
-
-         if (!READ_R_TURN_PIN()&&!turndish_dart.reset_r_turn_flag)
-         {
-             turndish_dart.turn_r_motor.angle_p.set=0xff;
-             turndish_dart.turn_r_motor.speed_p.set = dart_init_speed.init_speed_turn;
-         }
-         if (READ_R_TURN_PIN()&&!turndish_dart.reset_r_turn_flag)
-         {
-             turndish_dart.reset_r_turn_flag = true;
-             turndish_dart.turn_r_motor_reset();
-             turndish_dart.turn_r_motor.angle_p.set = turndish_dart.reset_turn_pos;
-         }
+        // if (!READ_L_TURN_PIN()&&!turndish_dart.reset_l_turn_flag)
+        // {
+        //     turndish_dart.turn_l_motor.angle_p.set=0xff;
+        //     turndish_dart.turn_l_motor.speed_p.set = dart_init_speed.init_speed_turn;
+        // }
+        //  if (READ_L_TURN_PIN()&&!turndish_dart.reset_l_turn_flag)
+        //  {
+        //      turndish_dart.reset_l_turn_flag = true;
+        //      turndish_dart.turn_l_motor_reset();
+        //      turndish_dart.turn_l_motor.angle_p.set = turndish_dart.reset_turn_pos;
+        //
+        //  }
+        //
+        //  if (!READ_R_TURN_PIN()&&!turndish_dart.reset_r_turn_flag)
+        //  {
+        //      turndish_dart.turn_r_motor.angle_p.set=0xff;
+        //      turndish_dart.turn_r_motor.speed_p.set = dart_init_speed.init_speed_turn;
+        //  }
+        //  if (READ_R_TURN_PIN()&&!turndish_dart.reset_r_turn_flag)
+        //  {
+        //      turndish_dart.reset_r_turn_flag = true;
+        //      turndish_dart.turn_r_motor_reset();
+        //      turndish_dart.turn_r_motor.angle_p.set = turndish_dart.reset_turn_pos;
+        //  }
          //判断扳机是否复位成功
          if (!READ_TRIGGER_PIN()&&!launcher_dart.reset_trigger_flag)
          {
@@ -379,11 +380,9 @@ static void dart_reset()
          }
 
          if (gimbal_dart.reset_yaw_flag && launcher_dart.reset_push_l_flag &&
-             launcher_dart.reset_trigger_flag && launcher_dart.reset_push_r_flag &&
-             turndish_dart.reset_l_turn_flag && turndish_dart.reset_r_turn_flag &&
-             MOTOR_L_TURN_CHECK_POS() && MOTOR_R_TURN_CHECK_POS() &&
+             launcher_dart.reset_trigger_flag && launcher_dart.reset_push_r_flag  &&
              MOTOR_PUSH_L_CHECK_POS() &&MOTOR_YAW_CHECK_POS() &&
-             MOTOR_TRIGGER_CHECK_POS() && MOTOR_PUSH_R_CHECK_POS())
+             MOTOR_TRIGGER_CHECK_POS() && MOTOR_PUSH_R_CHECK_POS())//&&turndish_dart.reset_l_turn_flag && turndish_dart.reset_r_turn_flag && MOTOR_L_TURN_CHECK_POS() && MOTOR_R_TURN_CHECK_POS()
          {
              break;
          }
@@ -1305,7 +1304,7 @@ static void dart_mode_set()
                 gimbal_dart.mode = DART_BACK;
             }
         }
-#if 0
+#if 1
     if (switch_is_up(rc_ctrl.rc.s[RC_s_L]) && switch_is_up(rc_ctrl.rc.s[RC_s_R]))
         {
             gimbal_dart.mode = DART_CONTROL;

@@ -12,5 +12,6 @@
 
 
 extern void adjust_task(void const*pvParameters);
+void Adjust_Board_Restart_Receive(void);
 
 #endif //DART_2026_ADJUST_BOARD_H

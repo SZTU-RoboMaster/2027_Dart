@@ -303,6 +303,7 @@ typedef struct
     bool finish_flag;
     uint8_t dart_goal;
     uint8_t launcherable_num;
+    float yaw_angle_offset[3][4];
     float yaw_angle_set[3];
     float trigger_distance_set[3][4];
 }Dart_Goal_Set_t;
