@@ -180,7 +180,8 @@ void Rest_Init()
   HAL_GPIO_WritePin(TURN_R_GPIO_Port,TURN_R_Pin,GPIO_PIN_SET);
   HAL_GPIO_WritePin(TURN_L_GPIO_Port,TURN_L_Pin,GPIO_PIN_SET);
   HAL_GPIO_WritePin(PUSH_L_GPIO_Port,PUSH_L_Pin,GPIO_PIN_SET);
-  HAL_GPIO_WritePin(PUSH_R_GPIO_Port,PUSH_L_Pin,GPIO_PIN_SET);
+  /* 左右推板使用不同引脚；原来这里重复写左推板，右推板始终保持初始化低电平。 */
+  HAL_GPIO_WritePin(PUSH_R_GPIO_Port,PUSH_R_Pin,GPIO_PIN_SET);
   HAL_GPIO_WritePin(YWA_GPIO_Port,YWA_Pin,GPIO_PIN_SET);
   HAL_GPIO_WritePin(Triger_GPIO_Port,Triger_Pin,GPIO_PIN_SET);
 

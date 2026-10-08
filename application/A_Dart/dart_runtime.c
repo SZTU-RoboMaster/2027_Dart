@@ -10,6 +10,7 @@
 #include "dart_parameters.h"
 #include "dart_platform.h"
 #include "dart_sm.h"
+#include "bsp_can.h"
 #if DART_ENABLE_CAROUSEL_LOADER
 #include "loader/carousel_lift_loader.h"
 #include "loader/dart_reload_strategy.h"
@@ -292,6 +293,17 @@ void dart_runtime_task(void const *argument)
         refresh_topics(now_ms);
         legacy_operator_bridge(now_ms);
         dart_sm_step(&runtime.sm, &runtime.feedback, &runtime.vision, &runtime.referee, now_ms);
+        if (runtime.sm.status.state == DART_STATE_FAULT_LATCHED &&
+            runtime.previous_state != DART_STATE_FAULT_LATCHED &&
+            runtime.sm.status.fault == DART_FAULT_FEEDBACK_STALE) {
+            /* 故障发生的这一周期保存缺失轴，避免锁定后 CAN 恢复掩盖原始原因。 */
+            uint32_t missing = 0U;
+            if (!runtime.feedback.online[DART_AXIS_TRIGGER]) missing |= 1UL << DART_AXIS_TRIGGER;
+            if (!runtime.feedback.online[DART_AXIS_PUSH_LEFT]) missing |= 1UL << DART_AXIS_PUSH_LEFT;
+            if (!runtime.feedback.online[DART_AXIS_PUSH_RIGHT]) missing |= 1UL << DART_AXIS_PUSH_RIGHT;
+            if (!runtime.feedback.online[DART_AXIS_YAW]) missing |= 1UL << DART_AXIS_YAW;
+            dart_can_diag_capture(missing);
+        }
         if ((runtime.previous_state == DART_STATE_RECOVERING ||
              runtime.previous_state == DART_STATE_HOMING) &&
             runtime.sm.status.state != runtime.previous_state) {

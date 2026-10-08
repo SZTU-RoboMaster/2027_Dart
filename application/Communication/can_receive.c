@@ -2,6 +2,7 @@
 
 #include "../A_Dart/dart.h"
 #include "dart_build_config.h"
+#include "bsp_can.h"
 #include "DM_MOTOR.h"
 #include "main.h"
 
@@ -107,11 +108,15 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     CAN_RxHeaderTypeDef header;
     uint8_t data[8];
+    /* 先记录中断是否到达，再区分 FIFO 读失败和报文标识不匹配。 */
+    if (hcan == &hcan2) dart_can_diag.can2_irq_count++;
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+        if (hcan == &hcan2) dart_can_diag.can2_rx_error_count++;
         return;
     }
 
     if (hcan == &hcan1) {
+        dart_can_diag.can1_rx_count++;
         switch (header.StdId) {
             case CAN_DM4310_TURN:
                 /* 达妙水平轴驱动自行解析位置、速度和力矩。 */
@@ -136,6 +141,9 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     if (hcan != &hcan2) {
         return;
     }
+
+    dart_can_diag.can2_rx_count++;
+    dart_can_diag.can2_last_id = header.StdId;
 
     /*
      * 数组下标属于板级资源映射：零和一是右、左推板，二是扳机，三和四是可选左右
@@ -173,6 +181,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             motor_3508_last_update[4] = HAL_GetTick();
             break;
         default:
+            dart_can_diag.can2_unknown_count++;
             break;
     }
 }

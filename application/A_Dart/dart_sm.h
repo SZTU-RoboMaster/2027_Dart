@@ -33,6 +33,10 @@ typedef struct {
     uint32_t pair_skew_started_ms;
     bool pair_left_homed;
     bool pair_right_homed;
+    /* 扳机回零堵转保护；故障原因在锁定后保留，供调试器直接查看。 */
+    bool trigger_stall_active;
+    uint32_t trigger_stall_started_ms;
+    uint8_t trigger_home_failure_reason; /* 0 无；1 找限位堵转；2 找限位超时；3 回位堵转；4 回位超时。 */
 } dart_sm_t;
 
 /**

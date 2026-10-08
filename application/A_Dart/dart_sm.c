@@ -32,6 +32,10 @@
 #define PUSH_HOME_SPEED          -500.0f
 #define TRIGGER_HOME_SPEED       4000.0f
 #define TRIGGER_RESET_POSITION    -55.0f
+#define TRIGGER_STALL_GRACE_MS     300U
+#define TRIGGER_STALL_HOLD_MS      150U
+#define TRIGGER_STALL_SPEED_RPM   100.0f
+#define TRIGGER_SETTLE_STALL_DISTANCE 5.0f
 #define YAW_HOME_SPEED          -1000.0f
 #define YAW_RESET_POSITION         73.944f
 
@@ -108,7 +112,8 @@ static void transition(dart_sm_t *sm, dart_state_t state, uint32_t now_ms)
 {
     /* 所有状态进入动作统一收口，防止上一状态的计时/单次动作标志泄漏。 */
     sm->status.state = state;
-    sm->status.substate = 0U;
+    /* 锁定故障时保留失败的回零子步骤；进入其他状态才从第一步重新开始。 */
+    if (state != DART_STATE_FAULT_LATCHED) sm->status.substate = 0U;
     sm->status.state_entered_ms = now_ms;
     sm->substate_started_ms = now_ms;
     sm->action_started = false;
@@ -117,6 +122,7 @@ static void transition(dart_sm_t *sm, dart_state_t state, uint32_t now_ms)
     sm->pair_skew_active = false;
     sm->pair_left_homed = false;
     sm->pair_right_homed = false;
+    sm->trigger_stall_active = false;
 }
 
 /**
@@ -133,6 +139,36 @@ static void next_substate(dart_sm_t *sm, uint32_t now_ms)
     sm->pair_skew_active = false;
     sm->pair_left_homed = false;
     sm->pair_right_homed = false;
+    sm->trigger_stall_active = false;
+}
+
+/**
+ * @brief 判断扳机电机是否在未到位时持续处于接近零转速。
+ *
+ * 进入子步骤后先允许三百毫秒启动时间，随后只有连续一百五十毫秒低于
+ * 一百转每分钟才判断为堵转。该判断只用于提前安全停机；限位 GPIO
+ * 才能确认机械零点，堵转绝不能被当作到位条件。
+ *
+ * @param sm 当前状态机，保存连续低速开始时刻。
+ * @param speed_rpm 当前扳机电机反馈转速。
+ * @param now_ms 当前单调毫秒时刻。
+ *
+ * @return
+ * - true：持续低速达到保护时间，应立即停止扳机；
+ * - false：尚在启动阶段、仍有运动或低速时间不足。
+ */
+static bool trigger_stalled(dart_sm_t *sm, float speed_rpm, uint32_t now_ms)
+{
+    if (!elapsed(now_ms, sm->substate_started_ms, TRIGGER_STALL_GRACE_MS) ||
+        fabsf(speed_rpm) >= TRIGGER_STALL_SPEED_RPM) {
+        sm->trigger_stall_active = false;
+        return false;
+    }
+    if (!sm->trigger_stall_active) {
+        sm->trigger_stall_active = true;
+        sm->trigger_stall_started_ms = now_ms;
+    }
+    return elapsed(now_ms, sm->trigger_stall_started_ms, TRIGGER_STALL_HOLD_MS);
 }
 
 /**
@@ -343,11 +379,16 @@ static void trigger_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, ui
     /* 未触发限位时恒速寻找；触发后先停电流，再把该机械点写为编码器零点。 */
     if (!feedback->limit[DART_AXIS_TRIGGER]) {
         command_speed(sm, DART_AXIS_TRIGGER, TRIGGER_HOME_SPEED);
-        if (action_timeout(sm, now_ms, true)) {
+        if (trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms)) {
+            sm->trigger_home_failure_reason = 1U;
+            report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
+        } else if (action_timeout(sm, now_ms, true)) {
+            sm->trigger_home_failure_reason = 2U;
             report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
         }
         return;
     }
+    sm->trigger_home_failure_reason = 0U;
     disable_axis(sm, DART_AXIS_TRIGGER);
     sm->platform->zero_axis(DART_AXIS_TRIGGER);
     next_substate(sm, now_ms);
@@ -368,7 +409,13 @@ static void trigger_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, 
     command_position(sm, DART_AXIS_TRIGGER, TRIGGER_RESET_POSITION);
     if (near(feedback->position[DART_AXIS_TRIGGER], TRIGGER_RESET_POSITION, POSITION_TRIGGER_EPSILON)) {
         next_substate(sm, now_ms);
+    } else if (fabsf(feedback->position[DART_AXIS_TRIGGER] - TRIGGER_RESET_POSITION) >
+                   TRIGGER_SETTLE_STALL_DISTANCE &&
+               trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms)) {
+        sm->trigger_home_failure_reason = 3U;
+        report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
     } else if (action_timeout(sm, now_ms, true)) {
+        sm->trigger_home_failure_reason = 4U;
         report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
     }
 }
@@ -570,6 +617,7 @@ static void start_recovery(dart_sm_t *sm, bool from_fault, uint32_t now_ms)
     sm->status.homed = false;
     sm->recovery_complete = false;
     sm->fire_requested = false;
+    sm->trigger_home_failure_reason = 0U;
     sm->output.launcher_open = false;
     transition(sm, DART_STATE_RECOVERING, now_ms);
 }
