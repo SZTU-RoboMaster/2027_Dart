@@ -6,6 +6,12 @@
 
 #include "dart_reload_strategy.h"
 
+/* 上电回零时每组核心轴独立保存步骤与超时起点，互不等待。 */
+typedef struct {
+    uint8_t stage;           /* 0 找限位；1 离开限位；2 已到安全位置。 */
+    uint32_t started_ms;     /* 当前步骤开始的时刻。 */
+} dart_home_progress_t;
+
 /*
  * 一份 Dart 状态机实例的完整可变上下文。
  * 正式固件由 DartTask 持有一份，仿真环境也可以创建独立实例。所有指针成员都引用
@@ -28,6 +34,10 @@ typedef struct {
     bool fire_requested;        /* 已收到操作员发射命令，等待裁判许可。 */
     bool recovery_from_fault;   /* 当前恢复由故障触发，完成后仍需人工确认。 */
     bool recovery_complete;     /* 机械恢复已完成，可安全清除故障锁存。 */
+    /* 仅上电回零使用；工作中复位仍按原有受控恢复顺序执行。 */
+    dart_home_progress_t home_trigger;
+    dart_home_progress_t home_push;
+    dart_home_progress_t home_yaw;
     /* 左右推板限位回零时使用的成对同步记录。 */
     bool pair_skew_active;
     uint32_t pair_skew_started_ms;

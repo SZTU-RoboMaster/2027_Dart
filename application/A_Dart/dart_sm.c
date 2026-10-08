@@ -40,15 +40,10 @@
 #define YAW_RESET_POSITION         73.944f
 
 enum {
-    /* 上电回零顺序：扳机 -> 推板对 -> 可选换弹机构 -> Yaw。 */
-    HOME_TRIGGER_SEEK = 0,
-    HOME_TRIGGER_SETTLE,
-    HOME_PUSH_SEEK,
-    HOME_PUSH_SETTLE,
-    HOME_OPTIONAL_LOADER,
-    HOME_YAW_SEEK,
-    HOME_YAW_SETTLE,
-    HOME_FINISHED
+    /* 上电回零时，三组核心轴分别推进；可选换弹机构待三组结束后启动。 */
+    HOME_STAGE_SEEK = 0,
+    HOME_STAGE_SETTLE,
+    HOME_STAGE_DONE
 };
 
 enum {
@@ -123,6 +118,12 @@ static void transition(dart_sm_t *sm, dart_state_t state, uint32_t now_ms)
     sm->pair_left_homed = false;
     sm->pair_right_homed = false;
     sm->trigger_stall_active = false;
+    if (state == DART_STATE_HOMING) {
+        /* 三组核心轴共享启动时刻，但之后各自维护找限位和回位超时。 */
+        sm->home_trigger = (dart_home_progress_t){ HOME_STAGE_SEEK, now_ms };
+        sm->home_push = (dart_home_progress_t){ HOME_STAGE_SEEK, now_ms };
+        sm->home_yaw = (dart_home_progress_t){ HOME_STAGE_SEEK, now_ms };
+    }
 }
 
 /**
@@ -152,14 +153,16 @@ static void next_substate(dart_sm_t *sm, uint32_t now_ms)
  * @param sm 当前状态机，保存连续低速开始时刻。
  * @param speed_rpm 当前扳机电机反馈转速。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 当前扳机找限位或回位步骤的独立起点。
  *
  * @return
  * - true：持续低速达到保护时间，应立即停止扳机；
  * - false：尚在启动阶段、仍有运动或低速时间不足。
  */
-static bool trigger_stalled(dart_sm_t *sm, float speed_rpm, uint32_t now_ms)
+static bool trigger_stalled(dart_sm_t *sm, float speed_rpm,
+                            uint32_t now_ms, uint32_t started_ms)
 {
-    if (!elapsed(now_ms, sm->substate_started_ms, TRIGGER_STALL_GRACE_MS) ||
+    if (!elapsed(now_ms, started_ms, TRIGGER_STALL_GRACE_MS) ||
         fabsf(speed_rpm) >= TRIGGER_STALL_SPEED_RPM) {
         sm->trigger_stall_active = false;
         return false;
@@ -289,16 +292,18 @@ static void report_fault(dart_sm_t *sm, dart_fault_code_t fault, bool can_recove
  *
  * @param sm 状态机对象。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 待检查动作的独立超时起点。
  * @param homing true 使用回零超时；false 使用普通动作超时。
  *
  * @return
  * - true：当前步骤已经达到或超过对应时限；
  * - false：当前步骤仍处于允许执行时间内。
  */
-static bool action_timeout(const dart_sm_t *sm, uint32_t now_ms, bool homing)
+static bool action_timeout(const dart_sm_t *sm, uint32_t now_ms,
+                           uint32_t started_ms, bool homing)
 {
     uint32_t limit = homing ? sm->parameters->homing_timeout_ms : sm->parameters->action_timeout_ms;
-    return elapsed(now_ms, sm->substate_started_ms, limit);
+    return elapsed(now_ms, started_ms, limit);
 }
 
 /**
@@ -368,30 +373,34 @@ static bool push_pair_synchronized(const dart_sm_t *sm, const dart_feedback_t *f
  * @brief 推进扳机轴寻找机械限位并登记零点的步骤。
  *
  * 限位未触发时持续给出固定方向速度；触发后立即禁用扳机输出、登记编码器零点并进入
- * 下一子步骤。寻找过程超时会进入不可继续运动的回零故障。
+ * 下一子步骤。寻找过程超时会进入不可继续运动的回零故障。调用方仅在返回 true 时
+ * 更新自己的步骤记录，因此上电并行回零和工作中顺序恢复可复用同一物理判断。
  *
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 本组找限位步骤的独立超时起点。
+ * @return true 表示已命中限位并登记零点；false 表示尚未完成或已锁存故障。
  */
-static void trigger_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool trigger_home_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                              uint32_t now_ms, uint32_t started_ms)
 {
     /* 未触发限位时恒速寻找；触发后先停电流，再把该机械点写为编码器零点。 */
     if (!feedback->limit[DART_AXIS_TRIGGER]) {
         command_speed(sm, DART_AXIS_TRIGGER, TRIGGER_HOME_SPEED);
-        if (trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms)) {
+        if (trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms, started_ms)) {
             sm->trigger_home_failure_reason = 1U;
             report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
-        } else if (action_timeout(sm, now_ms, true)) {
+        } else if (action_timeout(sm, now_ms, started_ms, true)) {
             sm->trigger_home_failure_reason = 2U;
             report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
         }
-        return;
+        return false;
     }
     sm->trigger_home_failure_reason = 0U;
     disable_axis(sm, DART_AXIS_TRIGGER);
     sm->platform->zero_axis(DART_AXIS_TRIGGER);
-    next_substate(sm, now_ms);
+    return true;
 }
 
 /**
@@ -402,22 +411,26 @@ static void trigger_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, ui
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 本组离限位步骤的独立超时起点。
+ * @return true 表示扳机已到安全位置；false 表示尚未完成或已锁存故障。
  */
-static void trigger_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool trigger_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                                uint32_t now_ms, uint32_t started_ms)
 {
     /* 离开限位并运动到扳机安全待机位置，真实位置到达后才允许下一步。 */
     command_position(sm, DART_AXIS_TRIGGER, TRIGGER_RESET_POSITION);
     if (near(feedback->position[DART_AXIS_TRIGGER], TRIGGER_RESET_POSITION, POSITION_TRIGGER_EPSILON)) {
-        next_substate(sm, now_ms);
+        return true;
     } else if (fabsf(feedback->position[DART_AXIS_TRIGGER] - TRIGGER_RESET_POSITION) >
                    TRIGGER_SETTLE_STALL_DISTANCE &&
-               trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms)) {
+               trigger_stalled(sm, feedback->speed[DART_AXIS_TRIGGER], now_ms, started_ms)) {
         sm->trigger_home_failure_reason = 3U;
         report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
-    } else if (action_timeout(sm, now_ms, true)) {
+    } else if (action_timeout(sm, now_ms, started_ms, true)) {
         sm->trigger_home_failure_reason = 4U;
         report_fault(sm, DART_FAULT_HOME_TRIGGER, false, now_ms);
     }
+    return false;
 }
 
 /**
@@ -430,8 +443,11 @@ static void trigger_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, 
  * @param sm 状态机对象，内部保存两侧完成标志和时间差计时。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 推板组找限位步骤的独立超时起点。
+ * @return true 表示左右均命中限位并校零；false 表示尚未完成或已锁存故障。
  */
-static void push_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool push_home_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                           uint32_t now_ms, uint32_t started_ms)
 {
     /*
      * 左右推板同时开始寻找限位。某一侧先到时立即单独停轴并记录其 offset，另一侧最多
@@ -457,14 +473,15 @@ static void push_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint3
     if (sm->pair_skew_active && sm->pair_left_homed != sm->pair_right_homed &&
         elapsed(now_ms, sm->pair_skew_started_ms, PAIR_LIMIT_SKEW_MS)) {
         report_fault(sm, DART_FAULT_PUSH_SYNC, false, now_ms);
-        return;
+        return false;
     }
 
     if (sm->pair_left_homed && sm->pair_right_homed) {
-        next_substate(sm, now_ms);
-    } else if (action_timeout(sm, now_ms, true)) {
+        return true;
+    } else if (action_timeout(sm, now_ms, started_ms, true)) {
         report_fault(sm, DART_FAULT_HOME_PUSH, false, now_ms);
     }
+    return false;
 }
 
 /**
@@ -476,18 +493,22 @@ static void push_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint3
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms 推板组回位步骤的独立超时起点。
+ * @return true 表示两侧均到安全后位；false 表示尚未完成或已锁存故障。
  */
-static void push_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool push_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                             uint32_t now_ms, uint32_t started_ms)
 {
     /* 两侧同步离开限位并返回 BACK；位置差超限时同时停轴并锁定故障。 */
     command_push_pair(sm, sm->parameters->push_back_position);
     if (!push_pair_synchronized(sm, feedback)) {
         report_fault(sm, DART_FAULT_PUSH_SYNC, false, now_ms);
     } else if (push_pair_reached(feedback, sm->parameters->push_back_position)) {
-        next_substate(sm, now_ms);
-    } else if (action_timeout(sm, now_ms, true)) {
+        return true;
+    } else if (action_timeout(sm, now_ms, started_ms, true)) {
         report_fault(sm, DART_FAULT_HOME_PUSH, false, now_ms);
     }
+    return false;
 }
 
 /**
@@ -499,8 +520,9 @@ static void push_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, uin
  *
  * @param sm 状态机对象，必须绑定完整换弹策略操作表。
  * @param now_ms 当前单调毫秒时刻。
+ * @return true 表示换弹机构已回零；false 表示仍在运行或已锁存故障。
  */
-static void loader_home_step(dart_sm_t *sm, uint32_t now_ms)
+static bool loader_home_step(dart_sm_t *sm, uint32_t now_ms)
 {
     /*
      * 所选策略拥有完整换弹机构回零（包括离开限位后的稳定位置）。拆机策略会立即返回
@@ -510,17 +532,18 @@ static void loader_home_step(dart_sm_t *sm, uint32_t now_ms)
         if (sm->reload_ops->start_home == NULL ||
             !sm->reload_ops->start_home(sm->reload_context)) {
             report_fault(sm, DART_FAULT_LOADER, false, now_ms);
-            return;
+            return false;
         }
         sm->action_started = true;
     }
     sm->reload_ops->step(sm->reload_context, now_ms);
     dart_reload_status_t status = sm->reload_ops->get_status(sm->reload_context);
     if (status.result == DART_RELOAD_DONE) {
-        next_substate(sm, now_ms);
+        return true;
     } else if (status.result == DART_RELOAD_FAULT) {
         report_fault(sm, status.fault, false, now_ms);
     }
+    return false;
 }
 
 /**
@@ -532,20 +555,23 @@ static void loader_home_step(dart_sm_t *sm, uint32_t now_ms)
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms Yaw 找限位步骤的独立超时起点。
+ * @return true 表示已命中限位并校零；false 表示尚未完成或已锁存故障。
  */
-static void yaw_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool yaw_home_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                          uint32_t now_ms, uint32_t started_ms)
 {
     /* Yaw 单轴寻找限位，命中后停止并更新编码器绝对累计 offset。 */
     if (!feedback->limit[DART_AXIS_YAW]) {
         command_speed(sm, DART_AXIS_YAW, YAW_HOME_SPEED);
-        if (action_timeout(sm, now_ms, true)) {
+        if (action_timeout(sm, now_ms, started_ms, true)) {
             report_fault(sm, DART_FAULT_HOME_YAW, false, now_ms);
         }
-        return;
+        return false;
     }
     disable_axis(sm, DART_AXIS_YAW);
     sm->platform->zero_axis(DART_AXIS_YAW);
-    next_substate(sm, now_ms);
+    return true;
 }
 
 /**
@@ -557,23 +583,43 @@ static void yaw_home_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
  * @param now_ms 当前单调毫秒时刻。
+ * @param started_ms Yaw 回位步骤的独立超时起点。
+ * @return true 表示 Yaw 已到安全角度；false 表示尚未完成或已锁存故障。
  */
-static void yaw_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
+static bool yaw_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback,
+                            uint32_t now_ms, uint32_t started_ms)
 {
     /* 从限位点回到中间安全角度，避免长期顶住机械限位。 */
     command_position(sm, DART_AXIS_YAW, YAW_RESET_POSITION);
     if (near(feedback->position[DART_AXIS_YAW], YAW_RESET_POSITION, POSITION_YAW_EPSILON)) {
-        next_substate(sm, now_ms);
-    } else if (action_timeout(sm, now_ms, true)) {
+        return true;
+    } else if (action_timeout(sm, now_ms, started_ms, true)) {
         report_fault(sm, DART_FAULT_HOME_YAW, false, now_ms);
     }
+    return false;
 }
 
 /**
- * @brief 按固定顺序推进上电自动回零。
+ * @brief 把三组上电回零进度编码为可直接在调试器查看的子状态。
  *
- * 顺序为扳机找限位并离开、推板对找限位并返回后位、可选换弹机构回零、水平轴找限位并
- * 回安全位置。任一步未完成时不会跳到后续步骤。
+ * 每组占两位：扳机占位 0～1，推板占位 2～3，Yaw 占位 4～5；每组数值 0、1、2
+ * 分别代表找限位、回安全位、已完成。故障锁存时保留最近一次编码值。
+ *
+ * @param sm 当前状态机，上电回零进度字段必须已经初始化。
+ */
+static void publish_home_substate(dart_sm_t *sm)
+{
+    sm->status.substate = (uint8_t)(sm->home_trigger.stage |
+                                     (sm->home_push.stage << 2U) |
+                                     (sm->home_yaw.stage << 4U));
+}
+
+/**
+ * @brief 同时推进扳机、左右推板组和 Yaw 的上电回零。
+ *
+ * 三组核心轴在同一个控制周期开始找限位，各自拥有独立的步骤和超时起点。已经完成的
+ * 轴保持安全位置，不等待其他轴才回位。任一组报告故障后立即停止本周期后续推进，
+ * 故障入口会禁用全部轴。只有三组均到安全位置后，才调用可选换弹机构的回零接口。
  *
  * @param sm 状态机对象。
  * @param feedback 当前控制周期反馈。
@@ -581,25 +627,70 @@ static void yaw_settle_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint
  */
 static void homing_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32_t now_ms)
 {
-    /* 每个 case 只允许在自己的真实完成条件满足后 next_substate。 */
-    switch (sm->status.substate) {
-        case HOME_TRIGGER_SEEK: trigger_home_step(sm, feedback, now_ms); break;
-        case HOME_TRIGGER_SETTLE: trigger_settle_step(sm, feedback, now_ms); break;
-        case HOME_PUSH_SEEK: push_home_step(sm, feedback, now_ms); break;
-        case HOME_PUSH_SETTLE: push_settle_step(sm, feedback, now_ms); break;
-        case HOME_OPTIONAL_LOADER: loader_home_step(sm, now_ms); break;
-        case HOME_YAW_SEEK: yaw_home_step(sm, feedback, now_ms); break;
-        case HOME_YAW_SETTLE: yaw_settle_step(sm, feedback, now_ms); break;
-        case HOME_FINISHED:
-            sm->status.homed = true;
-            sm->status.fault = DART_FAULT_NONE;
-            hold_safe_positions(sm);
-            transition(sm, DART_STATE_STANDBY, now_ms);
-            break;
-        default:
-            report_fault(sm, DART_FAULT_ACTION_TIMEOUT, false, now_ms);
-            break;
+    dart_home_progress_t *trigger = &sm->home_trigger;
+    dart_home_progress_t *push = &sm->home_push;
+    dart_home_progress_t *yaw = &sm->home_yaw;
+    sm->output.launcher_open = false;
+
+    /* 扳机命中限位后独立退回安全位置；堵转计时在两个阶段之间重新开始。 */
+    if (trigger->stage == HOME_STAGE_SEEK) {
+        if (trigger_home_step(sm, feedback, now_ms, trigger->started_ms)) {
+            trigger->stage = HOME_STAGE_SETTLE;
+            trigger->started_ms = now_ms;
+            sm->trigger_stall_active = false;
+        }
+    } else if (trigger->stage == HOME_STAGE_SETTLE) {
+        if (trigger_settle_step(sm, feedback, now_ms, trigger->started_ms)) {
+            trigger->stage = HOME_STAGE_DONE;
+        }
+    } else {
+        command_position(sm, DART_AXIS_TRIGGER, TRIGGER_RESET_POSITION);
     }
+    if (sm->status.state != DART_STATE_HOMING) return;
+    publish_home_substate(sm);
+
+    /* 两侧推板作为一个逻辑组同时找限位，各自校零后共同退回后位。 */
+    if (push->stage == HOME_STAGE_SEEK) {
+        if (push_home_step(sm, feedback, now_ms, push->started_ms)) {
+            push->stage = HOME_STAGE_SETTLE;
+            push->started_ms = now_ms;
+        }
+    } else if (push->stage == HOME_STAGE_SETTLE) {
+        if (push_settle_step(sm, feedback, now_ms, push->started_ms)) {
+            push->stage = HOME_STAGE_DONE;
+        }
+    } else {
+        command_push_pair(sm, sm->parameters->push_back_position);
+    }
+    if (sm->status.state != DART_STATE_HOMING) return;
+    publish_home_substate(sm);
+
+    /* Yaw 与扳机、推板并行找限位，独立返回安全角度。 */
+    if (yaw->stage == HOME_STAGE_SEEK) {
+        if (yaw_home_step(sm, feedback, now_ms, yaw->started_ms)) {
+            yaw->stage = HOME_STAGE_SETTLE;
+            yaw->started_ms = now_ms;
+        }
+    } else if (yaw->stage == HOME_STAGE_SETTLE) {
+        if (yaw_settle_step(sm, feedback, now_ms, yaw->started_ms)) {
+            yaw->stage = HOME_STAGE_DONE;
+        }
+    } else {
+        command_position(sm, DART_AXIS_YAW, YAW_RESET_POSITION);
+    }
+    if (sm->status.state != DART_STATE_HOMING) return;
+
+    /* 三组全部完成后才启动可选机构；位 6 提示当前正在等待该机构。 */
+    publish_home_substate(sm);
+    if (trigger->stage != HOME_STAGE_DONE || push->stage != HOME_STAGE_DONE ||
+        yaw->stage != HOME_STAGE_DONE) return;
+
+    sm->status.substate |= 1U << 6U;
+    if (!loader_home_step(sm, now_ms)) return;
+    sm->status.homed = true;
+    sm->status.fault = DART_FAULT_NONE;
+    hold_safe_positions(sm);
+    transition(sm, DART_STATE_STANDBY, now_ms);
 }
 
 /**
@@ -619,6 +710,11 @@ static void start_recovery(dart_sm_t *sm, bool from_fault, uint32_t now_ms)
     sm->fire_requested = false;
     sm->trigger_home_failure_reason = 0U;
     sm->output.launcher_open = false;
+    /* 先撤销上电并行回零或当前业务留下的目标，下一周期再由恢复步骤逐项启用。 */
+    for (uint8_t axis = 0U; axis < DART_AXIS_COUNT; ++axis) {
+        disable_axis(sm, (dart_axis_t)axis);
+    }
+    sm->output.loader_turn_enabled = false;
     transition(sm, DART_STATE_RECOVERING, now_ms);
 }
 
@@ -656,13 +752,27 @@ static void recovery_step(dart_sm_t *sm, const dart_feedback_t *feedback, uint32
             }
             break;
         }
-        case RECOVER_TRIGGER_SEEK: trigger_home_step(sm, feedback, now_ms); break;
-        case RECOVER_TRIGGER_SETTLE: trigger_settle_step(sm, feedback, now_ms); break;
-        case RECOVER_PUSH_SEEK: push_home_step(sm, feedback, now_ms); break;
-        case RECOVER_PUSH_SETTLE: push_settle_step(sm, feedback, now_ms); break;
-        case RECOVER_OPTIONAL_LOADER_HOME: loader_home_step(sm, now_ms); break;
-        case RECOVER_YAW_SEEK: yaw_home_step(sm, feedback, now_ms); break;
-        case RECOVER_YAW_SETTLE: yaw_settle_step(sm, feedback, now_ms); break;
+        case RECOVER_TRIGGER_SEEK:
+            if (trigger_home_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_TRIGGER_SETTLE:
+            if (trigger_settle_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_PUSH_SEEK:
+            if (push_home_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_PUSH_SETTLE:
+            if (push_settle_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_OPTIONAL_LOADER_HOME:
+            if (loader_home_step(sm, now_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_YAW_SEEK:
+            if (yaw_home_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
+        case RECOVER_YAW_SETTLE:
+            if (yaw_settle_step(sm, feedback, now_ms, sm->substate_started_ms)) next_substate(sm, now_ms);
+            break;
         case RECOVER_FINISHED:
             sm->status.shot_index = 0U;
             sm->status.goal = DART_GOAL_NONE;

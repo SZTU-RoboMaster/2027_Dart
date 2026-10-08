@@ -183,7 +183,8 @@ void Rest_Init()
   /* 左右推板使用不同引脚；原来这里重复写左推板，右推板始终保持初始化低电平。 */
   HAL_GPIO_WritePin(PUSH_R_GPIO_Port,PUSH_R_Pin,GPIO_PIN_SET);
   HAL_GPIO_WritePin(YWA_GPIO_Port,YWA_Pin,GPIO_PIN_SET);
-  HAL_GPIO_WritePin(Triger_GPIO_Port,Triger_Pin,GPIO_PIN_SET);
+  /* 与 master 一致：释放 PC2 的扳机相关控制线；PD12 留给 TIM4 的 PWM 功能。 */
+  HAL_GPIO_WritePin(TRIGGER_GPIO_Port,TRIGGER_Pin,GPIO_PIN_SET);
 
 
 }

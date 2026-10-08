@@ -30,7 +30,7 @@ typedef enum {
 typedef enum {
     /* 对外可观察的顶层生命周期；更细的子状态只由所属模块解释。 */
     DART_STATE_BOOT = 0,       /* 上电初始化，等待首批核心轴反馈。 */
-    DART_STATE_HOMING,         /* 按固定顺序执行整机自动回零。 */
+    DART_STATE_HOMING,         /* 核心轴并行执行上电自动回零。 */
     DART_STATE_STANDBY,        /* 已回零安全待机，可选择目标并开始新一轮。 */
     DART_STATE_MANUAL,         /* 预留的人工维护模式，当前只保证发射关闭。 */
     DART_STATE_PREPARE,        /* 校验目标和发序号，准备启动换弹事务。 */
@@ -144,7 +144,7 @@ typedef struct {
 typedef struct {
     /* 面向界面、遥测和故障诊断的精简状态快照。 */
     dart_state_t state;       /* 当前顶层业务状态。 */
-    uint8_t substate;         /* 当前状态内的物理步骤号，故障时保留现场。 */
+    uint8_t substate;         /* 恢复态为步骤号；上电回零态每两位表示一组进度，故障时保留现场。 */
     uint8_t shot_index;       /* 零基发序号，只在完整发射后递增。 */
     dart_goal_t goal;         /* 当前一轮锁定的目标。 */
     dart_fault_code_t fault;  /* 当前锁存故障码。 */
