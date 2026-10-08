@@ -1,7 +1,3 @@
-//
-// Created by liang on 2025-04-08.
-//
-
 #ifndef OMNI_INFANTRY_DM_MOTOR_H
 #define OMNI_INFANTRY_DM_MOTOR_H
 
@@ -10,13 +6,13 @@
 #include "../application/Communication/can_receive.h"
 #include "user_lib.h"
 
+/* è¾¾å¦™ç”µæœºä¸€å¸§åé¦ˆçš„åŸå§‹å®šç‚¹å€¼ã€è§£ç ç‰©ç†é‡å’Œé€šä¿¡æš‚å­˜åŒºã€‚ */
 typedef struct {
-
-    int p_int, v_int, t_int;                // ÕûĞÍµÄµç»úÎ»ÖÃ¡¢ËÙ¶È¡¢Å¤¾ØÊı¾İ
-    fp32 position, velocity, torque;        // ¸¡µãĞÍµÄµç»úÎ»ÖÃ¡¢ËÙ¶È¡¢Å¤¾ØÊı¾İ
-    uint8_t  Tx_Data[8];					// Êı¾İ·¢ËÍ´æ´¢
-    uint8_t  RxData[8];						// Êı¾İ½ÓÊÕ´æ´¢
-    CAN_RxHeaderTypeDef Rx_pHeader;         // ½ÓÊÕÖ¡Í·¶¨Òå
+    int p_int, v_int, t_int;         /* åè®®ä¸­çš„ä½ç½®ã€é€Ÿåº¦å’Œè½¬çŸ©å®šç‚¹æ•´æ•°ã€‚ */
+    fp32 position, velocity, torque; /* è§£ç åçš„æµ®ç‚¹ç‰©ç†é‡ã€‚ */
+    uint8_t Tx_Data[8];              /* å…«å­—èŠ‚å‘é€æš‚å­˜åŒºã€‚ */
+    uint8_t RxData[8];               /* å…«å­—èŠ‚æ¥æ”¶æš‚å­˜åŒºã€‚ */
+    CAN_RxHeaderTypeDef Rx_pHeader;  /* æœ€è¿‘ä¸€å¸§æ¥æ”¶å¤´ï¼Œä¾›åº•å±‚è¯Šæ–­ä½¿ç”¨ã€‚ */
 
 }DM_Motor_t;
 
@@ -26,15 +22,12 @@ extern fp32 DM_Velocity;
 extern first_order_filter_type_t DM_Velocity_Filter;
 
 extern uint8_t DM_Enable_CMD[8];
-// DMµç»úÊ§ÄÜ
 extern uint8_t DM_Disable_CMD[8];
-// DMµç»ú±£´æÁãµã
 extern uint8_t DM_Save_ZeroPoint_CMD[8];
-// DMµç»úÇå´í
 extern uint8_t DM_Clear_Error_CMD[8];
 
 extern void DM_Send_CMD(CAN_TYPE can_type, can_msg_id_e motor_id, uint8_t *cmd);
 extern void DM_MIT_Ctrl_Motor(CAN_TYPE can_type, uint16_t id, fp32 _pos, fp32 _vel, fp32 _KP, fp32 _KD, fp32 _troq);
 extern void DM_Motor_Decode(DM_Motor_t *motor, CAN_TYPE can_type, uint32_t can_id, uint8_t *data);
 
-#endif //OMNI_INFANTRY_DM_MOTOR_H
+#endif /* OMNI_INFANTRY_DM_MOTOR_H */

@@ -261,6 +261,12 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /*
+   * 先把本包交给静态接收缓冲，再立刻重新挂接端点。协议校验和结构解析由 DecodeTask
+   * 完成，USB 回调不执行耗时业务逻辑。
+   */
+  extern void usb_receiver(uint8_t *buf, uint32_t len);
+  usb_receiver(Buf, *Len);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);

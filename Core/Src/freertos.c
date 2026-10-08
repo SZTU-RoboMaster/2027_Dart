@@ -18,11 +18,12 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
-#include "Adjust_Board.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "main.h"
-#include "cmsis_os.h"
+#include "app_tasks.h"
+#include "decode.h"
+#include "topic_bus.h"
+#include "usb_task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -37,7 +38,6 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* USER CODE BEGIN PV */
-QueueHandle_t CDC_send_queue;   // ← 全局变量定义，不能加static
 /* USER CODE END PV */
 
 /* USER CODE END PD */
@@ -51,24 +51,11 @@ QueueHandle_t CDC_send_queue;   // ← 全局变量定义，不能加static
 /* USER CODE BEGIN Variables */
 
 /* USER CODE END Variables */
-osThreadId defaultTaskHandle;
-osThreadId detectTaskHandle;
-osThreadId USBTaskHandle;
-osThreadId DecodeTaskHandle;
-osThreadId DartTaskHandle;
-
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
 /* USER CODE END FunctionPrototypes */
 
-void StartDefaultTask(void const * argument);
-void detect_task(void const * argument);
-void usb_task(void const * argument);
-void decode_task(void const * argument);
-void dart_task(void const * argument);
-
-extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
 /* GetIdleTaskMemory prototype (linked to static allocation support) */
@@ -80,10 +67,10 @@ static StackType_t xIdleStack[configMINIMAL_STACK_SIZE];
 
 void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize )
 {
+  /* 空闲任务同样使用静态控制块和静态栈，系统运行期间不从堆申请内存。 */
   *ppxIdleTaskTCBBuffer = &xIdleTaskTCBBuffer;
   *ppxIdleTaskStackBuffer = &xIdleStack[0];
   *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
-  /* place for user code */
 }
 /* USER CODE END GET_IDLE_TASK_MEMORY */
 
@@ -110,134 +97,42 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  CDC_send_queue = xQueueCreate(1, 128);
+  /*
+   * 先创建跨任务通信资源，再创建可能立即访问这些资源的业务任务。三个初始化函数都
+   * 使用静态存储并保持幂等，避免启动顺序造成空句柄访问。
+   */
+  topic_bus_init();
+  decode_transport_init();
+  usb_task_queue_init();
 
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
-
-  /* definition and creation of detectTask */
-  osThreadDef(detectTask, detect_task, osPriorityIdle, 0, 128);
-  detectTaskHandle = osThreadCreate(osThread(detectTask), NULL);
-
-  /* definition and creation of USBTask */
-  osThreadDef(USBTask, usb_task, osPriorityIdle, 0, 128);
-  USBTaskHandle = osThreadCreate(osThread(USBTask), NULL);
-
-  /* definition and creation of DecodeTask */
-  osThreadDef(DecodeTask, decode_task, osPriorityIdle, 0, 128);
-  DecodeTaskHandle = osThreadCreate(osThread(DecodeTask), NULL);
-
-  /* definition and creation of DartTask */
-  osThreadDef(DartTask, dart_task, osPriorityIdle, 0, 256);
-  DartTaskHandle = osThreadCreate(osThread(DartTask), NULL);
-
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  osThreadDef(adjustTask, adjust_task, osPriorityNormal, 0, 258);
-  osThreadCreate(osThread(adjustTask), NULL);
+  /* 四个业务任务由统一静态描述表创建，任一创建失败都在启动阶段立即暴露。 */
+  configASSERT(app_tasks_init());
 
   /* USER CODE END RTOS_THREADS */
 
 }
 
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
-{
-  /* init code for USB_DEVICE */
-  MX_USB_DEVICE_Init();
-  /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartDefaultTask */
-}
-
-/* USER CODE BEGIN Header_detect_task */
-/**
-* @brief Function implementing the detectTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_detect_task */
-__weak void detect_task(void const * argument)
-{
-  /* USER CODE BEGIN detect_task */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END detect_task */
-}
-
-/* USER CODE BEGIN Header_usb_task */
-/**
-* @brief Function implementing the USBTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_usb_task */
-__weak void usb_task(void const * argument)
-{
-  /* USER CODE BEGIN usb_task */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END usb_task */
-}
-
-/* USER CODE BEGIN Header_decode_task */
-/**
-* @brief Function implementing the DecodeTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_decode_task */
-__weak void decode_task(void const * argument)
-{
-  /* USER CODE BEGIN decode_task */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END decode_task */
-}
-
-/* USER CODE BEGIN Header_dart_task */
-/**
-* @brief Function implementing the DartTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_dart_task */
-__weak void dart_task(void const * argument)
-{
-  /* USER CODE BEGIN dart_task */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END dart_task */
-}
-
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *task_name)
+{
+  /* 栈溢出后禁止继续驱动机构；保留参数便于调试器检查故障任务。 */
+  (void)task;
+  (void)task_name;
+  taskDISABLE_INTERRUPTS();
+  for (;;) {}
+}
+
+void vApplicationMallocFailedHook(void)
+{
+  /* 工程原则上不在运行期申请堆；若第三方组件申请失败，则立即进入安全停机。 */
+  taskDISABLE_INTERRUPTS();
+  for (;;) {}
+}
 
 /* USER CODE END Application */

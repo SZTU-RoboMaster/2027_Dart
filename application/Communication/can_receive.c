@@ -1,261 +1,210 @@
-//
-// Created by xhuanc on 2021/9/27.
-//
-
 #include "can_receive.h"
-#include "cmsis_os.h"
-#include "main.h"
-#include "../Chassis/Chassis.h"
-#include "math.h"
-#include "../Referee_system/Detection.h"
-#include "../Gimbal/launcher.h"
-#include "../Chassis/Cap.h"
-#include "bsp_cap.h"
+
 #include "../A_Dart/dart.h"
+#include "dart_build_config.h"
 #include "DM_MOTOR.h"
+#include "main.h"
+
+/*
+ * 当前板卡的 CAN 收发实现
+ * -----------------------
+ * CAN1 接收达妙水平轴以及可选的换弹转盘，CAN2 接收扳机、左右推板、左右升降和水平轴
+ * 的大疆电机反馈。中断只完成定长报文解码和更新时间记录，不运行 PID、不推进状态机。
+ * 这样可以控制中断执行时间，并让所有业务判断统一发生在 DartTask 的反馈快照中。
+ */
 
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 
-/******************** define *******************/
+/*
+ * 解码大疆电机固定八字节反馈。
+ * 使用单语句宏是为了避免函数调用开销；保护性循环保证它可以安全出现在条件分支中。
+ */
+#define GET_MOTOR_MEASURE(measure, bytes)                                      \
+    do {                                                                        \
+        (measure)->last_ecd = (measure)->ecd;                                   \
+        (measure)->ecd = (uint16_t)((bytes)[0] << 8 | (bytes)[1]);              \
+        (measure)->speed_rpm = (int16_t)((bytes)[2] << 8 | (bytes)[3]);         \
+        (measure)->given_current = (int16_t)((bytes)[4] << 8 | (bytes)[5]);     \
+        (measure)->temperate = (bytes)[6];                                      \
+    } while (0)
 
-//电子数据解算,do while作为保护性代码，防止在展开时被错误编译
-#define get_motor_measure(ptr, data)                                    \
-    do{                                                                 \
-        (ptr)->last_ecd = (ptr)->ecd;                                   \
-        (ptr)->ecd = (uint16_t)((data)[0] << 8 | (data)[1]);            \
-        (ptr)->speed_rpm = (uint16_t)((data)[2] << 8 | (data)[3]);      \
-        (ptr)->given_current = (uint16_t)((data)[4] << 8 | (data)[5]);  \
-        (ptr)->temperate = (data)[6];                                   \
-    } while(0)
-
-//电机总编码值的计算,do while作为保护性代码，防止在展开时被错误编译
-#define get_motor_round_cnt(ptr)  \
-    do{                            \
-             if(ptr.ecd-ptr.last_ecd> 4192){ \
-                ptr.round_cnt--;                    \
-             }                   \
-             else if(ptr.ecd-ptr.last_ecd< -4192)    \
-             {                   \
-                ptr.round_cnt++;            \
-             }                   \
-             ptr.total_ecd= ptr.round_cnt*8192+ptr.ecd-ptr.offset_ecd;\
-                                 \
-    }while(0)
-//电机真实距离计算
-#define get_motor_real_distance(ptr)\
-{\
-    get_motor_round_cnt(ptr);\
-    ptr.torque_round_cnt=ptr.total_ecd/8192.f; \
-    ptr.real_round_cnt=ptr.torque_round_cnt/19.f; \
-    ptr.real_angle_deg=fmodf(ptr.real_round_cnt,1.0f);             \
-    if(ptr.real_angle_deg<0.0f)ptr.real_angle_deg+=1.0f;                \
-    ptr.real_angle_deg*=360.0f;     \
-    ptr.total_dis=ptr.real_round_cnt*wheel_circumference;      \
-}\
-
-//3508减速比
-#define motor_3508_reduction_ratio (3591.0f/187.0f)
-//轮子周长
-#define wheel_circumference (70*2*3.14f)
-/******************** variable *******************/
-
-motor_measure_t motor_3508_measure[4];//0-3 分别对应  RF,LF,LB,RB
-
-motor_measure_t motor_yaw_measure;
-motor_measure_t motor_pitch_measure;
-motor_measure_t motor_turn_measure;
+/*
+ * 把零至八千一百九十一的单圈值展开为连续多圈值。
+ * 相邻反馈跨过半圈时才视为跨越编码器零点，避免普通高速变化被误判为整圈跳变。
+ */
+#define UPDATE_MOTOR_ROUND_COUNT(measure)                                      \
+    do {                                                                        \
+        if ((measure).ecd - (measure).last_ecd > 4192) {                        \
+            (measure).round_cnt--;                                              \
+        } else if ((measure).ecd - (measure).last_ecd < -4192) {               \
+            (measure).round_cnt++;                                              \
+        }                                                                       \
+        (measure).total_ecd =                                                   \
+            (measure).round_cnt * 8192 + (measure).ecd - (measure).offset_ecd;  \
+    } while (0)
 
 motor_measure_t motor_3508[5];
-motor_measure_t motor_2006[3];
 motor_measure_t motor_6020[2];
+volatile uint32_t motor_3508_last_update[5];
+volatile uint32_t motor_6020_last_update[2];
+volatile uint32_t dm6006_last_update;
 
+/* 发送缓冲区仅由 DartTask 使用；集中保存可避免每周期在任务栈上分配八字节数组。 */
+static CAN_TxHeaderTypeDef motor_tx_header;
+static uint8_t motor_tx_data[8];
 
-motor_measure_t motor_yaw_measure;
-motor_measure_t motor_pitch_measure;
-motor_measure_t motor_shoot_measure[4];//0:TRIGGER,建为数组方便以后添加
-motor_measure_t motor_2006_measure[1];//TRIGGER
-extern cap2_info_t cap2;
+/**
+ * @brief 按大疆电机协议发送一组四路电流命令。
+ *
+ * 四个有符号电流按高字节在前打包到同一标准 CAN 帧，并根据总线编号选择 CAN1 或 CAN2。
+ * 本函数只提交一次发送，不等待邮箱完成；当前调用路径由 DartTask 单独拥有发送缓冲区。
+ *
+ * @param can_type 目标 CAN 控制器编号。
+ * @param command_id 电机组命令标准标识符。
+ * @param motor1 第一通道电流命令。
+ * @param motor2 第二通道电流命令。
+ * @param motor3 第三通道电流命令。
+ * @param motor4 第四通道电流命令。
+ */
+void CAN_cmd_motor(CAN_TYPE can_type,
+                   can_msg_id_e command_id,
+                   int16_t motor1,
+                   int16_t motor2,
+                   int16_t motor3,
+                   int16_t motor4)
+{
+    uint32_t mailbox;
+    motor_tx_header.StdId = command_id;
+    motor_tx_header.IDE = CAN_ID_STD;
+    motor_tx_header.RTR = CAN_RTR_DATA;
+    motor_tx_header.DLC = 8U;
 
-static CAN_TxHeaderTypeDef tx_message;
-static uint8_t can_send_data[8];
-int32_t cap_percentage;
+    /* 协议规定高字节在前，显式拆分可避免处理器字节序影响总线数据。 */
+    motor_tx_data[0] = (uint8_t)(motor1 >> 8);
+    motor_tx_data[1] = (uint8_t)motor1;
+    motor_tx_data[2] = (uint8_t)(motor2 >> 8);
+    motor_tx_data[3] = (uint8_t)motor2;
+    motor_tx_data[4] = (uint8_t)(motor3 >> 8);
+    motor_tx_data[5] = (uint8_t)motor3;
+    motor_tx_data[6] = (uint8_t)(motor4 >> 8);
+    motor_tx_data[7] = (uint8_t)motor4;
 
-int cap_can_cnt = 0;
-
-void cap2_info_decode(cap2_info_t *cap,uint8_t *rx_data){
-    cap->mode=rx_data[0];
-//    cap->rec_cap_cmd=rx_data[1];
-//    cap->cap_voltage=rx_data[2];
-    cap->cap_voltage=(uint16_t)(rx_data[2]<<8|rx_data[3]);
-//    cap->chassis_current=(uint16_t)(rx_data[4]<<8|rx_data[5])/1000;
-    cap_percentage=cap->cap_voltage/22.f;
-
-    cap_can_cnt++;
+    CAN_HandleTypeDef *bus = can_type == CAN_1 ? &hcan1 : &hcan2;
+    (void)HAL_CAN_AddTxMessage(bus, &motor_tx_header, motor_tx_data, &mailbox);
 }
 
-extern void dm8009_can_msg_unpack(uint32_t id, uint8_t data[]);
-
-
-//车轮电机的发送函数
-void CAN_cmd_motor(CAN_TYPE can_type, can_msg_id_e CMD_ID, int16_t motor1, int16_t motor2, int16_t motor3, int16_t motor4) {
-    uint32_t send_mail_box;
-    tx_message.StdId = CMD_ID;
-    tx_message.IDE = CAN_ID_STD;
-    tx_message.RTR = CAN_RTR_DATA;
-    tx_message.DLC = 0x08;
-    can_send_data[0] = motor1 >> 8;
-    can_send_data[1] = motor1;
-    can_send_data[2] = motor2 >> 8;
-    can_send_data[3] = motor2;
-    can_send_data[4] = motor3 >> 8;
-    can_send_data[5] = motor3;
-    can_send_data[6] = motor4 >> 8;
-    can_send_data[7] = motor4;
-
-    if (can_type == CAN_1) {
-        HAL_CAN_AddTxMessage(&hcan1, &tx_message, can_send_data, &send_mail_box);
-    } else if (can_type == CAN_2) {
-        HAL_CAN_AddTxMessage(&hcan2, &tx_message, can_send_data, &send_mail_box);
+/**
+ * @brief 解码 CAN 接收 FIFO0 中的一帧电机反馈。
+ *
+ * 回调先读取一帧数据，再按总线和标准标识符分派到对应电机对象。3508/6020 反馈会更新
+ * 多圈编码累计值和最后在线时刻；原换弹转盘反馈只在机构编译开关启用时处理。未知标识符
+ * 被安全忽略。该函数运行在 HAL 回调上下文，不执行阻塞操作。
+ *
+ * @param hcan 产生接收中断的 CAN 控制器句柄。
+ */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef header;
+    uint8_t data[8];
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+        return;
     }
-
-}
-
-
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-    CAN_RxHeaderTypeDef rx_header;
-
-    uint8_t rx_data[8];
-
-    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
 
     if (hcan == &hcan1) {
-        switch (rx_header.StdId) {
+        switch (header.StdId) {
             case CAN_DM4310_TURN:
-                DM_Motor_Decode(&YAW_Motor, CAN_1, rx_header.StdId,rx_data);
+                /* 达妙水平轴驱动自行解析位置、速度和力矩。 */
+                DM_Motor_Decode(&YAW_Motor, CAN_1, header.StdId, data);
                 break;
 
+#if DART_ENABLE_CAROUSEL_LOADER
             case CAN_DM6006_TURN:
-                DM_Motor_Decode(&turndish_dart.dm_turn_motor, CAN_1, rx_header.StdId, rx_data);
+                /* 只有明确安装原换弹机构时才解码转盘反馈并刷新其在线时刻。 */
+                DM_Motor_Decode(&turndish_dart.carousel_motor, CAN_1, header.StdId, data);
+                dm6006_last_update = HAL_GetTick();
                 break;
+#endif
 
-            default: {
+            default:
+                /* 当前固件不拥有的标识直接忽略。 */
                 break;
-            }
         }
-    }
-    if (hcan == &hcan2) {
-        //dm8009_can_msg_unpack(rx_header.StdId,rx_data);
-        switch (rx_header.StdId){
-            case CAN_3508_DRIVE_RIGHT: get_motor_measure(&motor_3508[0], rx_data);
-                get_motor_round_cnt(motor_3508[0]);
-                break;
-
-            case CAN_3508_DRIVE_LEFT: get_motor_measure(&motor_3508[1], rx_data);
-                get_motor_round_cnt(motor_3508[1]);
-                break;
-
-            case CAN_3508_TRIGGER: get_motor_measure(&motor_3508[2], rx_data);
-                get_motor_round_cnt(motor_3508[2]);
-                break;
-
-            case CAN_6020_YAW: get_motor_measure(&motor_6020[0], rx_data);
-                get_motor_round_cnt(motor_6020[0]);
-                break;
-            case CAN_3508_TURN_LEFT: get_motor_measure(&motor_3508[3], rx_data);
-                get_motor_round_cnt(motor_3508[3]);
-                break;
-
-            case CAN_3508_TURN_RIGHT: get_motor_measure(&motor_3508[4], rx_data);
-                get_motor_round_cnt(motor_3508[4]);
-                break;
-
-            default: {
-                break;
-            }
-        }
+        return;
     }
 
+    if (hcan != &hcan2) {
+        return;
+    }
+
+    /*
+     * 数组下标属于板级资源映射：零和一是右、左推板，二是扳机，三和四是可选左右
+     * 升降轴；6020 数组零号为水平轴。每帧解码后立即记录更新时间。
+     */
+    switch (header.StdId) {
+        case CAN_3508_DRIVE_RIGHT:
+            GET_MOTOR_MEASURE(&motor_3508[0], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_3508[0]);
+            motor_3508_last_update[0] = HAL_GetTick();
+            break;
+        case CAN_3508_DRIVE_LEFT:
+            GET_MOTOR_MEASURE(&motor_3508[1], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_3508[1]);
+            motor_3508_last_update[1] = HAL_GetTick();
+            break;
+        case CAN_3508_TRIGGER:
+            GET_MOTOR_MEASURE(&motor_3508[2], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_3508[2]);
+            motor_3508_last_update[2] = HAL_GetTick();
+            break;
+        case CAN_6020_YAW:
+            GET_MOTOR_MEASURE(&motor_6020[0], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_6020[0]);
+            motor_6020_last_update[0] = HAL_GetTick();
+            break;
+        case CAN_3508_TURN_LEFT:
+            GET_MOTOR_MEASURE(&motor_3508[3], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_3508[3]);
+            motor_3508_last_update[3] = HAL_GetTick();
+            break;
+        case CAN_3508_TURN_RIGHT:
+            GET_MOTOR_MEASURE(&motor_3508[4], data);
+            UPDATE_MOTOR_ROUND_COUNT(motor_3508[4]);
+            motor_3508_last_update[4] = HAL_GetTick();
+            break;
+        default:
+            break;
+    }
 }
 
-
-fp32 motor_ecd_to_rad_change(uint16_t ecd, uint16_t offset_ecd) {
-    int32_t relative_ecd = ecd - offset_ecd;
-    if (relative_ecd > HALF_ECD_RANGE) {
-        relative_ecd -= ECD_RANGE;
-    } else if (relative_ecd < -HALF_ECD_RANGE) {
-        relative_ecd += ECD_RANGE;
-    }
-
-    return ((fp32)relative_ecd * MOTOR_ECD_TO_RAD);
-}
-
-uint8_t CANx_SendStdData(CAN_HandleTypeDef *hcan,uint16_t ID,uint8_t *pData,uint16_t Len)
+/**
+ * @brief 提交一帧通用标准标识符 CAN 数据。
+ *
+ * 本函数构造标准数据帧并交给 HAL 选择空发送邮箱，不等待物理发送完成。
+ *
+ * @param hcan 目标 CAN 控制器句柄。
+ * @param id 十一位标准标识符。
+ * @param data 待发送数据地址。
+ * @param length 有效数据字节数，必须符合经典 CAN 单帧长度限制。
+ *
+ * @return
+ * - 0：HAL 已接受发送请求；
+ * - 1：参数、邮箱或底层 CAN 状态导致提交失败。
+ */
+uint8_t CANx_SendStdData(CAN_HandleTypeDef *hcan,
+                         uint16_t id,
+                         uint8_t *data,
+                         uint16_t length)
 {
-    static CAN_TxHeaderTypeDef   Tx_Header;
+    CAN_TxHeaderTypeDef header = {
+        .StdId = id,
+        .ExtId = 0U,
+        .IDE = CAN_ID_STD,
+        .RTR = CAN_RTR_DATA,
+        .DLC = length,
+    };
+    uint32_t mailbox;
 
-    Tx_Header.StdId=ID;
-    Tx_Header.ExtId=0;
-    Tx_Header.IDE=0;
-    Tx_Header.RTR=0;
-    Tx_Header.DLC=Len;
-
-    /*找到空的发送邮箱，把数据发送出去*/
-    if(HAL_CAN_AddTxMessage(hcan, &Tx_Header, pData, (uint32_t*)CAN_TX_MAILBOX0) != HAL_OK) //
-    {
-        if(HAL_CAN_AddTxMessage(hcan, &Tx_Header, pData, (uint32_t*)CAN_TX_MAILBOX1) != HAL_OK)
-        {
-            HAL_CAN_AddTxMessage(hcan, &Tx_Header, pData, (uint32_t*)CAN_TX_MAILBOX2);
-        }
-    }
-}
-
-
-//计算距离零点的度数  -180-180
-fp32 motor_ecd_to_angle_change(uint16_t ecd, uint16_t offset_ecd) {
-    int32_t tmp = 0;
-    if (offset_ecd >= 4096) {
-        if (ecd > offset_ecd - 4096) {
-            tmp = ecd - offset_ecd;
-        } else {
-            tmp = ecd + 8192 - offset_ecd;
-        }
-    } else {
-        if (ecd > offset_ecd + 4096) {
-            tmp = ecd - 8192 - offset_ecd;
-        } else {
-            tmp = ecd - offset_ecd;
-        }
-    }
-    return (fp32) tmp / 8192.f * 360;
-}
-
-void CAN_cmd_cap2(cap2_info_t*cap) {
-    uint32_t send_mail_box;
-    tx_message.StdId = 0x002;
-    tx_message.IDE = CAN_ID_STD;
-    tx_message.RTR = CAN_RTR_DATA;
-    tx_message.DLC = 0x06;
-    for (uint8_t i = 0; i <=4 ; ++i) {
-        can_send_data[i]=cap->send_data[i];
-    }
-    HAL_CAN_AddTxMessage(&hcan1, &tx_message, cap->send_data, &send_mail_box);
-}
-
-uint32_t get_can1_free_mailbox() {
-    if ((hcan1.Instance->TSR & CAN_TSR_TME0) != RESET) {
-        return CAN_TX_MAILBOX0;
-    } else if ((hcan1.Instance->TSR & CAN_TSR_TME1)
-               != RESET) { return CAN_TX_MAILBOX1; }
-    else if ((hcan1.Instance->TSR & CAN_TSR_TME2) != RESET) { return CAN_TX_MAILBOX2; }
-    else { return 0; }
-}
-
-uint32_t get_can2_free_mailbox() {
-    if ((hcan2.Instance->TSR & CAN_TSR_TME0) != RESET) {
-        return CAN_TX_MAILBOX0;
-    } else if ((hcan2.Instance->TSR & CAN_TSR_TME1)
-               != RESET) { return CAN_TX_MAILBOX1; }
-    else if ((hcan2.Instance->TSR & CAN_TSR_TME2) != RESET) { return CAN_TX_MAILBOX2; }
-    else { return 0; }
+    /* HAL 自动选择空邮箱；没有空邮箱或参数无效时把错误交给调用方处理。 */
+    return HAL_CAN_AddTxMessage(hcan, &header, data, &mailbox) == HAL_OK ? 0U : 1U;
 }

@@ -2,29 +2,14 @@
 #include "main.h"
 #include "string.h"
 
-/**
-  * @brief          get the sector number of flash
-  * @param[in]      address: flash address
-  * @retval         sector number
-  */
-/**
-  * @brief          ��ȡflash��sector��
-  * @param[in]      address: flash ��ַ
-  * @retval         sector��
-  */
+/* 内部地址换算声明；实现与公开兼容函数使用同一扇区表。 */
 static uint32_t get_sector(uint32_t address);
 
 /**
-  * @brief          erase flash
-  * @param[in]      address: flash address
-  * @param[in]      len: page num
-  * @retval         none
-  */
-/**
-  * @brief          ����flash
-  * @param[in]      address: flash ��ַ
-  * @param[in]      len: ҳ����
-  * @retval         none
+  * @说明 从指定地址所属扇区开始，擦除连续的若干扇区。
+  * @参数 address 任意位于首个目标扇区内的地址。
+  * @参数 len 连续擦除的扇区数量，不是字节数。
+  * @返回值 无；底层擦除错误由后续参数校验发现。
   */
 void flash_erase_address(uint32_t address, uint16_t len)
 {
@@ -42,18 +27,11 @@ void flash_erase_address(uint32_t address, uint16_t len)
 }
 
 /**
-  * @brief          write data to one page of flash
-  * @param[in]      start_address: flash address
-  * @param[in]      buf: data point
-  * @param[in]      len: data num
-  * @retval         success 0, fail -1
-  */
-/**
-  * @brief          ��һҳflashд����
-  * @param[in]      start_address: flash ��ַ
-  * @param[in]      buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         success 0, fail -1
+  * @说明 在起始地址所属扇区内顺序写入三十二位数据。
+  * @参数 start_address 首个写入地址，必须按四字节对齐。
+  * @参数 buf 待写入数据首地址。
+  * @参数 len 待写入的三十二位字数量。
+  * @返回值 成功返回零，任一字写入失败返回负一。
   */
 int8_t flash_write_single_address(uint32_t start_address, uint32_t *buf, uint32_t len)
 {
@@ -94,20 +72,12 @@ int8_t flash_write_single_address(uint32_t start_address, uint32_t *buf, uint32_
 }
 
 /**
-  * @brief          write data to some pages of flash
-  * @param[in]      start_address: flash start address
-  * @param[in]      end_address: flash end address
-  * @param[in]      buf: data point
-  * @param[in]      len: data num
-  * @retval         success 0, fail -1
-  */
-/**
-  * @brief          ����ҳflashд����
-  * @param[in]      start_address: flash ��ʼ��ַ
-  * @param[in]      end_address: flash ������ַ
-  * @param[in]      buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         success 0, fail -1
+  * @说明 在给定闭区间内顺序写入三十二位数据，可跨越多个扇区。
+  * @参数 start_address 首个写入地址。
+  * @参数 end_address 允许写入的最后地址。
+  * @参数 buf 待写入数据首地址。
+  * @参数 len 待写入的三十二位字数量。
+  * @返回值 成功返回零，任一字写入失败返回负一。
   */
 int8_t flash_write_muli_address(uint32_t start_address, uint32_t end_address, uint32_t *buf, uint32_t len)
 {
@@ -144,18 +114,11 @@ int8_t flash_write_muli_address(uint32_t start_address, uint32_t end_address, ui
 }
 
 /**
-  * @brief          read data for flash
-  * @param[in]      address: flash address
-  * @param[out]     buf: data point
-  * @param[in]      len: data num
-  * @retval         none
-  */
-/**
-  * @brief          ��flash������
-  * @param[in]      start_address: flash ��ַ
-  * @param[out]     buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         none
+  * @说明 利用芯片的存储器映射读取连续三十二位数据。
+  * @参数 address 首个读取地址。
+  * @参数 buf 接收数据的目标缓冲区。
+  * @参数 len 读取的三十二位字数量。
+  * @返回值 无。
   */
 void flash_read(uint32_t address, uint32_t *buf, uint32_t len)
 {
@@ -164,14 +127,9 @@ void flash_read(uint32_t address, uint32_t *buf, uint32_t len)
 
 
 /**
-  * @brief          get the sector number of flash
-  * @param[in]      address: flash address
-  * @retval         sector number
-  */
-/**
-  * @brief          ��ȡflash��sector��
-  * @param[in]      address: flash ��ַ
-  * @retval         sector��
+  * @说明 把第一存储体地址换算成硬件抽象层要求的扇区编号。
+  * @参数 address 待查询地址。
+  * @返回值 地址所在扇区的硬件编号；越界时返回第十一扇区作为安全兼容值。
   */
 uint32_t ger_sector(uint32_t address)
 {
@@ -233,14 +191,9 @@ uint32_t ger_sector(uint32_t address)
 }
 
 /**
-  * @brief          get the next page flash address
-  * @param[in]      address: flash address
-  * @retval         next page flash address
-  */
-/**
-  * @brief          ��ȡ��һҳflash��ַ
-  * @param[in]      address: flash ��ַ
-  * @retval         ��һҳflash��ַ
+  * @说明 返回第一存储体当前扇区之后的第一个地址。
+  * @参数 address 当前扇区内任意地址。
+  * @返回值 下一扇区起始地址；最后一个受支持扇区之后返回存储器末地址。
   */
 uint32_t get_next_flash_address(uint32_t address)
 {

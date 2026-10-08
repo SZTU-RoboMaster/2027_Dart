@@ -1,126 +1,46 @@
-//
-// Created by 86134 on 2025/11/27.
-//
 #include "Adjust_Board.h"
 
-#include "bsp_flash.h"
-#include "cmsis_os.h"
-#include "Send_to_Screen.h"
-#include "dart.h"
+#include "dart_parameters.h"
+#include "topic_bus.h"
 
-#define BUFF_SIZE  128
-static uint8_t rx_buff[BUFF_SIZE];
-
-static float Str_to_float (char *msg,int *len);
-fp32 outpost_base_value[8];
-
-void adjust_task(void const*pvParameters)
+/*
+ * AdjustTask：参数的唯一持久化拥有者
+ * ----------------------------------
+ * 1. 上电时从板级存储读取完整参数块；若数据为空、CRC 错误或版本不匹配，参数模块会
+ *    自动返回安全默认值。
+ * 2. 将当前有效参数发布到 TOPIC_DART_PARAMETERS，DartTask 只订阅该快照。
+ * 3. 阻塞等待参数更新事件；保存成功后才发布新参数，写 Flash 失败时继续保留旧值。
+ *
+ * 这种设计保证业务状态机永远不会看到“只修改了一半”的参数结构，也避免多个任务
+ * 同时擦写同一 Flash 扇区。
+ */
+/**
+ * @brief 运行参数加载、校验、保存和发布任务。
+ *
+ * 任务启动时从平台非易失存储读取完整参数；无效数据由参数模块替换为安全默认值。随后
+ * 阻塞等待参数更新事件，只有新参数校验并持久化成功后才替换当前快照并重新发布。任务
+ * 是参数写入的唯一拥有者，可避免多个输入源并发擦写 Flash。函数不会返回。
+ *
+ * @param argument 静态任务表保留参数，当前实现忽略该值。
+ */
+void adjust_task(void const *argument)
 {
-    Flash_Read_Data(outpost_base_value,8);
-    for (int i=0;i<4;i++)
-    {
-        dart_goal_set.trigger_distance_set[GOAL_FRONT_STATION][i] = outpost_base_value[i];
-    }
-    for (int i=0;i<4;i++)
-    {
-        dart_goal_set.trigger_distance_set[GOAL_BASE_STATION][i] = outpost_base_value[i+4];
-    }
-    HAL_UARTEx_ReceiveToIdle_IT(&huart1,rx_buff,BUFF_SIZE);
-    __HAL_DMA_DISABLE_IT(&hdma_usart1_rx,DMA_IT_HT);
-    while (1)
-    {
-        osDelay(1);
-    }
-}
+    (void)argument;
+    const dart_platform_ops_t *platform = dart_platform_stm32_get();
+    dart_parameters_t parameters;
 
-// void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,uint16_t size)
-// {
-//     if (huart->Instance==USART1)
-//     {
-//         if (size <= BUFF_SIZE)
-//         {
-//             if (rx_buff[0]==0x55&&rx_buff[1]==0x01)
-//             {
-//                 int len=2;
-//                 uint8_t cnt=0;
-            //     while (cnt<4)
-            //     {
-            //         if (rx_buff[len]==cnt+1)
-            //         {
-            //             len++;
-            //             float temp=Str_to_float(rx_buff,&len);
-            //             dart_goal_set.trigger_distance_set[1][cnt] = temp;
-            //             cnt++;
-            //         }
-            //     }
-            // }else
-            // if (rx_buff[0]==0x55&&rx_buff[1]==0x02)
-            // {
-            //     int len=2;
-            //     uint8_t cnt=0;
-            //     while (cnt<4)
-//                 {
-//                     if (rx_buff[len]==cnt+1)
-//                     {
-//                         len++;
-//                         float temp=Str_to_float(rx_buff,&len);
-//                         dart_goal_set.trigger_distance_set[2][cnt] = temp;
-//                         cnt++;
-//                     }
-//                 }
-//             }
-//             for (int i=0;i<4;i++)
-//             {
-//                 outpost_base_value[i] = dart_goal_set.trigger_distance_set[1][i];
-//             }
-//             for (int i=4;i<8;i++)
-//             {
-//                 outpost_base_value[i] = dart_goal_set.trigger_distance_set[2][i-4];
-//             }
-//             Flash_Write_Data(outpost_base_value,8);
-//         }
-//         memset(rx_buff,0,BUFF_SIZE);
-//         HAL_UARTEx_ReceiveToIdle_DMA(&huart1,rx_buff,BUFF_SIZE);
-//         __HAL_DMA_DISABLE_IT(&hdma_usart1_rx,DMA_IT_HT);
-//     }
-// }
+    /* load 返回 false 仅表示使用了默认值；parameters 本身始终可安全使用。 */
+    (void)dart_parameters_load(platform, &parameters);
+    (void)topic_publish(TOPIC_DART_PARAMETERS, &parameters);
 
-static float Str_to_float (char *msg,int *len)
-{
-    float temp=0;
-    uint8_t flag=0;
-    float point_va=1.0f;
-    if (msg[*len]!=0xff)
-    {
-        while (1)
-        {
-            if (msg[*len]!=0xff)
-            {
-                if (msg[*len]!='.'&&!flag)
-                {
-                    temp*=10;
-                    temp+=msg[*len]-'0';
-                    (*len)++;
-                }else
-                    if (msg[*len]=='.')
-                    {
-                        flag=1;
-                        (*len)++;
-                    }else
-                        if (msg[*len]!='.'&&flag)
-                        {
-                            point_va*=10;
-                            temp+=(float)(msg[*len]-'0')/(float)point_va;
-                            (*len)++;
-                        }
-            }else if (msg[*len]==0xff)
-            {
-                if (msg[(*len)+1]==0xff)
-                {
-                    (*len)++;
-                    (*len)++;
-                    return temp;
-                }
+    for (;;) {
+        parameter_update_t update;
+        /* 100 ms 超时使任务以后仍可加入非阻塞维护逻辑，不影响当前事件响应。 */
+        if (topic_event_take(TOPIC_PARAMETER_UPDATE, &update, 100U)) {
+            /* 只有完整校验并写入成功后，才替换运行时参数快照。 */
+            if (dart_parameters_save(platform, &update.parameters)) {
+                parameters = update.parameters;
+                (void)topic_publish(TOPIC_DART_PARAMETERS, &parameters);
             }
         }
     }

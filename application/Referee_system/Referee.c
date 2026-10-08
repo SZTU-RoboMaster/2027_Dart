@@ -1,1175 +1,374 @@
 #include "Referee.h"
-#include "string.h"
+
+#include <string.h>
+
 #include "CRC8_CRC16.h"
-#include "bsp_usart.h"
-#include "cmsis_os.h"
-#include "../Gimbal/Gimbal.h"
-#include "../Chassis/Chassis.h"
-#include "Detection.h"
-#include "bsp_cap.h"
-//#include "bsp_xidi_cap.h"
+#include "FreeRTOS.h"
+#include "dart_platform.h"
+#include "decode.h"
+#include "queue.h"
+#include "topic_bus.h"
 #include "../A_Dart/dart.h"
 
-extern cap_data_t Cap;
-extern UART_HandleTypeDef huart6;//
-extern gimbal_t gimbal;//获取云台模式
-extern chassis_t chassis;//获取底盘模式
-extern key_board_t KeyBoard;//获取键盘信息
-extern launcher_t launcher;//获取发射机构信息
-extern int32_t cap_percentage;//电容百分比，在can_receive.c文件中可见
-ext_ui_color uiColor;//判断ui颜色
-Graphic_Operate update_flag = UI_ADD;
-Graphic_Operate cir_cover_update_flag = UI_ADD;
-extern UART_HandleTypeDef huart6;
-extern UART_HandleTypeDef huart1;
-
-
-Graphic_Operate static_update_flag=UI_ADD;
-Graphic_Operate one_layer_update_flag=UI_ADD;
-Graphic_Operate two_layer_update_flag=UI_ADD;
-Graphic_Operate three_layer_update_flag=UI_ADD;
-
-uint8_t usart6_buf[REFEREE_BUFFER_SIZE]={0};  //缓存从串口接受的数据
-uint8_t usart1_buf[REFEREE_BUFFER_SIZE]={0};
-
-Referee_info_t Referee;
-bool launch_grant=false;
-uint16_t last_dart_launch_time;
-
 /*
- * UI更新状态
+ * 裁判系统接收与飞镖业务数据提取
+ * --------------------------------
+ * 串口空闲中断只负责冻结本次直接存储器访问接收长度，并把原始字节复制到静态队列；
+ * DecodeTask 在任务上下文中完成帧长检查、两级循环冗余校验、命令码分发和主题发布。
+ * 这样可以避免在中断中执行大段协议解析，也避免 DartTask 直接读取正在变化的协议结构。
+ *
+ * 原裁判界面绘图任务与当前飞镖业务无关，已经从本文件删除。未来串口屏应通过
+ * operator_interface 提交命令和读取状态，不再向本裁判协议模块添加界面业务。
  */
-ui_robot_status_t ui_robot_status={
 
-        .static_update=true,
-        .gimbal_mode=GIMBAL_RELAX,
-        .chassis_mode=CHASSIS_RELAX,
-        .block_warning=false,
-        .super_cap_value=0.f,
-        .shoot_heat_limit=0,
+extern UART_HandleTypeDef huart6;
 
-};
+/* 原始接收区由串口六的循环直接存储器访问持续写入。 */
+uint8_t usart6_buf[REFEREE_BUFFER_SIZE];
 
-/*函数和声明*/
-static void referee_unpack_fifo_data(void);
-static bool_t Referee_read_data(uint8_t *ReadFromUsart);
-static void ui_static_draw();
-/*裁判系统主任务*/
+/* 保留完整协议快照便于调试；飞镖状态机只订阅裁判状态主题。 */
+Referee_info_t Referee;
+bool launch_grant;
+uint8_t dart_launch_mode = 0xFFU;
+uint8_t dart_progress_mod = 0x01U;
+volatile uint32_t referee_last_update_ms;
 
-void dart_launch();
-void dart_launch_set();
-void dart_progress_get();
+typedef struct {
+    uint16_t length;                 /* 本次串口空闲中断实际收到的字节数。 */
+    uint8_t data[REFEREE_BUFFER_SIZE]; /* 与直接存储器访问区隔离的完整字节副本。 */
+} referee_rx_frame_t;
 
-extern fp32 INS_angle[3];
+#define REFEREE_RX_QUEUE_DEPTH 3U
 
-uint8_t ssss = 0;
+/* 队列控制块、数据区和中断暂存帧全部静态分配，不依赖堆。 */
+static QueueHandle_t referee_rx_queue;
+static StaticQueue_t referee_rx_queue_control;
+static uint8_t referee_rx_queue_storage[REFEREE_RX_QUEUE_DEPTH * sizeof(referee_rx_frame_t)];
+static referee_rx_frame_t referee_irq_frame;
 
-//串口中断函数
+/* 第二发后识别下一发射窗口所需的历史记录。 */
+static uint8_t dart_launch_count;
+static bool dart_launch_counted;
+
+static bool referee_read_frame(const uint8_t *frame, uint16_t available_length);
+static void update_launch_permission(void);
+static void update_launch_window(void);
+static void update_door_status(void);
+
+/**
+ * @brief 处理裁判串口空闲中断并把本批原始字节送入静态队列。
+ *
+ * 中断内不做协议校验和业务判断。队列满时丢弃本批数据，避免覆盖尚未解析的旧帧。
+ */
 void USART6_IRQHandler(void)
 {
-    static volatile uint8_t res;
-    if(USART6->SR & UART_FLAG_IDLE)
-    {
-        __HAL_UART_CLEAR_PEFLAG(&huart6);//读取UART6-SR 和UART6-DR; 清除中断标志位
-
-        __HAL_DMA_DISABLE(huart6.hdmarx); //使能dma_rx
-
-        Referee_read_data(&usart6_buf[0]);
-        dart_launch();
-        dart_launch_set();
-        dart_progress_get();
-
-        //memset(&usart6_buf[0],0,REFEREE_BUFFER_SIZE);//置0
-
-        __HAL_DMA_CLEAR_FLAG(huart6.hdmarx,DMA_LISR_TCIF1); //清除传输完成标志位
-
-        __HAL_DMA_SET_COUNTER(huart6.hdmarx, REFEREE_BUFFER_SIZE);//设置DMA 搬运数据大小 单位为字节
-
-        __HAL_DMA_ENABLE(huart6.hdmarx); //使能DMARx
-
+    if ((USART6->SR & UART_FLAG_IDLE) == 0U) {
+        return;
     }
-}
-//图传串口中断函数
 
-__weak void USART1_IRQHandler(void)
-{
-    // static volatile uint8_t res;
-    // if(USART1->SR & UART_FLAG_IDLE)
-    // {
-    //     __HAL_UART_CLEAR_PEFLAG(&huart1);//读取UART1-SR 和UART1-DR; 清除中断标志位
-    //
-    //     __HAL_DMA_DISABLE(huart1.hdmarx); //使能dma_rx
-    //
-    //     //Referee_read_data(&usart1_buf[0]);
-    //
-    //     memset(&usart1_buf[0],0,REFEREE_BUFFER_SIZE);//置0
-    //
-    //     __HAL_DMA_CLEAR_FLAG(huart1.hdmarx,DMA_LISR_TCIF1); //清除传输完成标志位
-    //
-    //     __HAL_DMA_SET_COUNTER(huart1.hdmarx, REFEREE_BUFFER_SIZE);//设置DMA 搬运数据大小 单位为字节
-    //
-    //     __HAL_DMA_ENABLE(huart1.hdmarx); //使能DMARx
-    //
-    //     detect_handle(DETECT_VIDEO_TRANSIMITTER);
-    //
-    // }
-}
+    /* 依次读取状态寄存器和数据寄存器，清除串口空闲中断标志。 */
+    __HAL_UART_CLEAR_PEFLAG(&huart6);
+    __HAL_DMA_DISABLE(huart6.hdmarx);
 
-//根据裁判系统信息判断机器人的ID和对应客户端的ID
-void judge_team_client(){
-    //本机器人为红方
-    if(Referee.GameRobotStat.robot_id<10)
-    {
-        Referee.ids.teammate_hero 	   = 1;
-        Referee.ids.teammate_engineer  = 2;
-        Referee.ids.teammate_infantry3 = 3;
-        Referee.ids.teammate_infantry4 = 4;
-        Referee.ids.teammate_infantry5 = 5;
-        Referee.ids.teammate_plane	   = 6;
-        Referee.ids.teammate_sentry		= 7;
+    const uint16_t received =
+        (uint16_t)(REFEREE_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(huart6.hdmarx));
+    if (referee_rx_queue != NULL && received > 0U) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        referee_irq_frame.length = received;
+        memcpy(referee_irq_frame.data, usart6_buf, received);
 
-        Referee.ids.client_hero 	 = 0x0101;
-        Referee.ids.client_engineer  = 0x0102;
-        Referee.ids.client_infantry3 = 0x0103;
-        Referee.ids.client_infantry4 = 0x0104;
-        Referee.ids.client_infantry5 = 0x0105;
-        Referee.ids.client_plane	 = 0x0106;
-
-        switch (Referee.GameRobotStat.robot_id) {
-            case Referee_hero_red:{
-                Referee.SelfClient=Referee.ids.client_hero;
-            }break;
-
-            case Referee_engineer_red:{
-                Referee.SelfClient=Referee.ids.client_engineer;
-            }break;
-
-            case Referee_infantry3_red:{
-                Referee.SelfClient=Referee.ids.client_infantry3;
-            }break;
-
-            case Referee_infantry4_red:{
-                Referee.SelfClient=Referee.ids.client_infantry4;
-            }break;
-
-            case Referee_infantry5_red:{
-                Referee.SelfClient=Referee.ids.client_infantry5;
-            }break;
-
-            case Referee_plane_red:{
-                Referee.SelfClient=Referee.ids.client_plane;
-            }break;
-
-            default:{
-
-            }break;
+        /* 队列满时丢弃整批数据，绝不覆盖 DecodeTask 尚未解析的旧帧。 */
+        if (xQueueSendFromISR(referee_rx_queue,
+                              &referee_irq_frame,
+                              &higher_priority_task_woken) == pdTRUE) {
+            decode_task_wake_from_isr();
         }
-
-    }//本机器人为蓝方
-    else{
-        Referee.ids.teammate_hero 		 	= 101;
-        Referee.ids.teammate_engineer  = 102;
-        Referee.ids.teammate_infantry3 = 103;
-        Referee.ids.teammate_infantry4 = 104;
-        Referee.ids.teammate_infantry5 = 105;
-        Referee.ids.teammate_plane		 = 106;
-        Referee.ids.teammate_sentry		= 107;
-
-        Referee.ids.client_hero 	 = 0x0165;
-        Referee.ids.client_engineer  = 0x0166;
-        Referee.ids.client_infantry3 = 0x0167;
-        Referee.ids.client_infantry4 = 0x0168;
-        Referee.ids.client_infantry5 = 0x0169;
-        Referee.ids.client_plane	 = 0x016A;
-
-        switch (Referee.GameRobotStat.robot_id) {
-            case Referee_hero_blue:{
-                Referee.SelfClient=Referee.ids.client_hero;
-            }break;
-
-            case Referee_engineer_blue:{
-                Referee.SelfClient=Referee.ids.client_engineer;
-            }break;
-
-            case Referee_infantry3_blue:{
-                Referee.SelfClient=Referee.ids.client_infantry3;
-            }break;
-
-            case Referee_infantry4_blue:{
-                Referee.SelfClient=Referee.ids.client_infantry4;
-            }break;
-
-            case Referee_infantry5_blue:{
-                Referee.SelfClient=Referee.ids.client_infantry5;
-            }break;
-
-            case Referee_plane_blue:{
-                Referee.SelfClient=Referee.ids.client_plane;
-            }break;
-
-            default:{
-
-            }break;
-        }
-
+        portYIELD_FROM_ISR(higher_priority_task_woken);
     }
+
+    /* 重新装载接收长度并恢复直接存储器访问，等待下一批串口数据。 */
+    __HAL_DMA_CLEAR_FLAG(huart6.hdmarx, DMA_LISR_TCIF1);
+    __HAL_DMA_SET_COUNTER(huart6.hdmarx, REFEREE_BUFFER_SIZE);
+    __HAL_DMA_ENABLE(huart6.hdmarx);
 }
-float all_rpm_mul_current = 0;
-float all_current_pingfang = 0;
-float power_nihe = 0;
 
-uint32_t cccc = 0;
-bool_t Referee_read_data(uint8_t *ReadFromUsart)
+/**
+ * @brief 初始化裁判接收静态队列和串口接收通道。
+ *
+ * 函数可重复调用；资源已经存在时直接返回。
+ */
+void referee_transport_init(void)
 {
-    int CmdID=0;//数据命令码解析
+    /* 初始化函数保持幂等，避免 DecodeTask 重入时重复创建队列或重复启动接收。 */
+    if (referee_rx_queue != NULL) {
+        return;
+    }
 
-    uint16_t judge_length;
+    referee_rx_queue = xQueueCreateStatic(REFEREE_RX_QUEUE_DEPTH,
+                                          sizeof(referee_rx_frame_t),
+                                          referee_rx_queue_storage,
+                                          &referee_rx_queue_control);
+    const dart_platform_ops_t *platform = dart_platform_stm32_get();
+    configASSERT(referee_rx_queue != NULL);
+    configASSERT(platform->referee_rx_start != NULL &&
+                 platform->referee_rx_start(usart6_buf, REFEREE_BUFFER_SIZE));
+}
+
+/* 仅在协议声明的载荷长度足够时复制，防止异常命令长度导致越过当前帧边界。 */
+#define COPY_REFEREE_FIELD(field, expected_length)                              \
+    do {                                                                        \
+        if (payload_length >= (expected_length)) {                              \
+            memcpy(&(field), frame + DATA, (expected_length));                 \
+        }                                                                       \
+    } while (0)
+
+/**
+ * @brief 校验并分发一帧完整裁判协议数据。
+ *
+ * @param frame 候选帧首地址。
+ * @param available_length 从该地址开始可安全读取的字节数。
+ * @return true 表示帧头、长度和两级校验均有效；false 表示该帧被拒绝。
+ */
+static bool referee_read_frame(const uint8_t *frame, uint16_t available_length)
+{
+    const uint16_t minimum_length =
+        Referee_LEN_FRAME_HEAD + Referee_LEN_CMD_ID + Referee_LEN_FRAME_TAIL;
+    if (frame == NULL || available_length < minimum_length || frame[SOF] != REFREE_HEADER_SOF) {
+        return false;
+    }
+    if (!verify_CRC8_check_sum((uint8_t *)frame, LEN_HEADER)) {
+        return false;
+    }
+
+    const uint16_t payload_length =
+        (uint16_t)frame[DATA_LENGTH] | ((uint16_t)frame[DATA_LENGTH + 1U] << 8U);
+    const uint16_t frame_length =
+        (uint16_t)(minimum_length + payload_length);
+    if (frame_length > available_length ||
+        !verify_CRC16_check_sum((uint8_t *)frame, frame_length)) {
+        return false;
+    }
+
+    const uint16_t command_id = (uint16_t)frame[CMD_ID] |
+                                ((uint16_t)frame[CMD_ID + 1U] << 8U);
+
+    /* 受击标志只表示当前解析帧是否为新的受击事件。 */
     Referee.RobotHurt.being_hurt = false;
-    if(ReadFromUsart==NULL) {
-        ssss++;
-        return 0 ;
-    }
-
-    memcpy(&Referee.FrameHeader,ReadFromUsart,Referee_LEN_FRAME_HEAD);
-    cccc++;
-    if(ReadFromUsart[SOF]==REFREE_HEADER_SOF) //判断帧头是否为0xA5
-    {
-        if(verify_CRC8_check_sum(ReadFromUsart,LEN_HEADER)) //CRC 帧头校验
-        {
-            judge_length=ReadFromUsart[DATA_LENGTH]+LEN_HEADER+Referee_LEN_CMD_ID+Referee_LEN_FRAME_TAIL;
-            if(verify_CRC16_check_sum(ReadFromUsart,judge_length))  //帧尾校验
-            {
-//                retval_tf=1;//表示数据可用
-                CmdID = (ReadFromUsart[6] << 8 | ReadFromUsart[5]);//解析数据命令码,将数据拷贝到相应结构体中(注意拷贝数据的长度)
-
-                switch (CmdID)
-                {
-
-                    case Referee_ID_game_state://0x0001 比赛状态 1HZ
-                        memcpy(&Referee.GameState,ReadFromUsart+DATA,Referee_LEN_game_state);
-                        break;
-
-                    case Referee_ID_game_result://0x0002 比赛结果   比赛结束后发送
-                        memcpy(&Referee.GameResult,ReadFromUsart+DATA,Referee_LEN_game_result);
-                        Referee.GameResult.game_over = true;
-                        break;
-
-                    case Referee_ID_game_robot_HP://0x0003 机器人状态HP   1HZ
-                        memcpy(&Referee.GameRobotHP,ReadFromUsart+DATA,Referee_LEN_game_robot_HP);
-                        break;
-
-//V1.6.1删除
-//                    case Referee_ID_game_dart_state: //0x0004 飞镖发射状态
-//                        memcpy(&Referee.GameDartStatus,ReadFromUsart+DATA,Referee_LED_game_missile_state);
-//                        break;
-//
-//                    case Referee_ID_game_buff: //0x0005 ICRA_BUFF状态     1HZ
-//                        memcpy(&Referee.GameICRABuff,ReadFromUsart+DATA,Referee_LED_game_buff);
-//                        break;
-
-                    case Referee_ID_event_data://0x0101 场地事件数据      1HZ
-                        memcpy(&Referee.EventData,ReadFromUsart+DATA,Referee_LEN_event_data);
-                        break;
-
-                    // case Referee_ID_supply_projectile_action://0x0102 场地补给站动作标识数据   动作改变之后发送
-                    //     memcpy(&Referee.SupplyProjectileAction,ReadFromUsart+DATA,Referee_LEN_supply_projectile_action);
-                    //     break;
-
-                    case Referee_ID_supply_warm://0x0104    裁判系统警告数据    己方警告之后发送
-                        memcpy(&Referee.RefereeWarning,ReadFromUsart+DATA,Referee_LEN_supply_warm);
-                        break;
-
-                    case Referee_ID_dart_info://0x0105    飞镖发射口倒计时    1HZ
-                        memcpy(&Referee.DartRemainingTime,ReadFromUsart+DATA,Referee_LEN_dart_info);
-                        break;
-
-                    case Referee_ID_game_robot_state://0x0201   机器人状态数据     10HZ
-                        memcpy(&Referee.GameRobotStat,ReadFromUsart+DATA,Referee_LEN_game_robot_state);
-                        judge_team_client();//判断一下机器人所属的队伍和类型 以及对应的机械人id和客户端id
-                        break;
-
-                    case Referee_ID_power_heat_data://0x0202    实时功率热量数据    50HZ
-                        memcpy(&Referee.PowerHeatData,ReadFromUsart+DATA,Referee_LEN_power_heat_data);
-                        //测量功率模型用，为使测量值测量频率和裁判系统回报的功率频率一致
-                        //收集数据
-                        float tmp1= 0,tmp2 = 0;
-                        for (int i = 0; i < 4; ++i) {
-//                            float filtercurrent= first_Kalman_Filter(&chassis_filter[i],chassis.motor_chassis[i].motor_measure->given_current);
-                            tmp1 += chassis.motor_chassis[i].motor_measure->given_current*chassis.motor_chassis[i].motor_measure->given_current;
-                            tmp2 += chassis.motor_chassis[i].motor_measure->speed_rpm*chassis.motor_chassis[i].motor_measure->given_current;
-                            //   tmp1+=pow(filtercurrent*20/16384.0,2);
-                            //  tmp2+=filtercurrent*20/16384.0*chassis.motor_chassis[i].motor_measure->speed_rpm;
-
-                        }
-                        all_current_pingfang = tmp1*20.0/16384*20/16384;//反馈电流值转国际单位/A
-                        all_rpm_mul_current = tmp2*20.0/16384;
-                        power_nihe = CHASSIS_POWER_R0*all_current_pingfang + CHASSIS_POWER_K0*all_rpm_mul_current + CHASSIS_POWER_P0;
-                        //          power_nihe = 0.000002623f*tmp2 + 0.0000001025f*tmp1 + 3.067f;
-
-                        if(power_nihe < 0)
-                            power_nihe = 0;
-                        break;
-
-                    case Referee_ID_game_robot_pos://0x0203     机器人位置数据     10HZ
-                        memcpy(&Referee.GameRobotPos,ReadFromUsart+DATA,Referee_LEN_game_robot_pos);
-                        break;
-
-                    case Referee_ID_buff_musk://0x0204  机器人增益数据     1HZ
-                        memcpy(&Referee.Buff,ReadFromUsart+DATA,Referee_LEN_buff_musk);
-                        break;
-
-                    case Referee_ID_aerial_robot_energy://0x0205    空中机器人能量状态数据 10HZ
-                        memcpy(&Referee.AerialRobotEnergy,ReadFromUsart+DATA,Referee_LEN_aerial_robot_energy);
-                        break;
-
-                    case Referee_ID_robot_hurt://0x0206     伤害状态数据  伤害发生后发送
-                        memcpy(&Referee.RobotHurt,ReadFromUsart+DATA,Referee_LEN_robot_hurt);
-                        Referee.RobotHurt.being_hurt = true;//受击判断
-                        break;
-
-                    case Referee_ID_shoot_data://0x0207     实时射击数据  射击后发送
-                        memcpy(&Referee.ShootData,ReadFromUsart+DATA,Referee_LEN_shoot_data);
-                        break;
-
-                    case Referee_ID_bullet_remaining://0x0208   剩余发射数   10HZ周期发送
-                        memcpy(&Referee.BulletRemaining,ReadFromUsart+DATA,Referee_LEN_bullet_remaining);
-                        break;
-
-                    case Referee_ID_rfid_status://0x0209    机器人RFID状态，1Hz
-                        memcpy(&Referee.RfidStatus,ReadFromUsart+DATA,Referee_LEN_rfid_status);
-                        break;
-
-                    case Referee_ID_dart_client_directive://0x020A  飞镖机器人客户端指令书, 10Hz
-                        memcpy(&Referee.DartClient,ReadFromUsart+DATA,Referee_LEN_dart_client_directive);
-                        break;
-
-                    case Referee_ID_dart_all_robot_position://0x020B
-                        memcpy(&Referee.RobotPosition,ReadFromUsart+DATA,Referee_LEN_dart_all_robot_position);
-                        break;
-
-                    case Referee_ID_radar_mark://0x020C
-                        memcpy(&Referee.RadarMark,ReadFromUsart+DATA,Referee_LEN_radar_mark);
-                        break;
-
-                    case Referee_ID_entry_info://0x020D
-                        memcpy(&Referee.SentryInfo,ReadFromUsart+DATA,Referee_LEN_entry_info);
-                        break;
-
-                    case Referee_ID_radar_info://0x020E
-                        memcpy(&Referee.RadarInfo,ReadFromUsart+DATA,Referee_LEN_radar_info);
-                        break;
-
-                    case Referee_ID_robot_interactive_header_data://0x0301
-                        memcpy(&Referee.StudentInteractive,ReadFromUsart+DATA,Referee_LEN_robot_interactive_header_data);
-                        break;
-
-                    case Referee_ID_map_command://0x0303
-                        memcpy(&Referee.MapCommand,ReadFromUsart+DATA,Referee_LEN_map_command);
-                        break;
-
-                    case Referee_ID_keyboard_information://0x0304
-                        memcpy(&Referee.keyboard,ReadFromUsart+DATA,Referee_LEN_keyboard_information);
-                        break;
-
-                    case Referee_ID_robot_map_robot_data://0x0305
-                        memcpy(&Referee.EnemyPosition,ReadFromUsart+DATA,Referee_LEN_robot_map_robot_data);
-                        break;
-
-                    case Referee_ID_robot_custom_client://0x0306
-                        memcpy(&Referee.Custom,ReadFromUsart+DATA,Referee_LEN_robot_custom_client);
-                        break;
-
-                    case Referee_ID_robot_entry_info_receive://0x0307
-                        memcpy(&Referee.SentryMapData,ReadFromUsart+DATA,Referee_LEN_robot_entry_info_receive);
-                        break;
-
-                    case Referee_ID_robot_custom_info_receive://0x0308
-                        memcpy(&Referee.SendData,ReadFromUsart+DATA,Referee_LEN_robot_custom_info_receive);
-                        break;
-
-                    default:
-                        break;
-                }
-                detect_handle(DETECT_REFEREE);
-            }
-        }
-        if(*(ReadFromUsart + sizeof(frame_header_struct_t) + Referee_LEN_CMD_ID + Referee.FrameHeader.data_length +Referee_LEN_FRAME_TAIL) == 0xA5)
-        {
-            //如果一个数据包出现了多帧数据,则再次读取
-            Referee_read_data(ReadFromUsart + sizeof(frame_header_struct_t) + Referee_LEN_CMD_ID + Referee.FrameHeader.data_length+ Referee_LEN_FRAME_TAIL);
-        }
-    }
-}
-
-
-//绘制变量
-uint8_t state_first_graphic;//0~7循环 更新的图层数
-uint8_t ClientTxBuffer[200];//发送给客户端的数据缓冲区
-uint8_t ClientTxCapBuffer[200];//电容数据发送的缓存区
-uint8_t ClientTxBufferChar[200];//字符型静态元素缓存区
-uint8_t ClientTxBufferRect[200];//自瞄方框提示
-uint8_t ClientTXBufferCir[200];//陀螺及弹舱提示
-//绘制数据
-//第0层画的字符串 字符串最长只能 30 Byte
-/**************************************/
-/**
- * 绘制字符串
- * @param graphic
- * @param name
- * @param op_type
- * @param layer
- * @param color
- * @param size
- * @param length
- * @param width
- * @param start_x
- * @param start_y
- * @param character
- */
-void String_Graphic(ui_string_t*clientData,
-                    const char* name,
-                    uint32_t op_type,
-                    uint32_t layer,
-                    uint32_t color,
-                    uint32_t size,
-                    uint32_t length,
-                    uint32_t width,
-                    uint32_t start_x,
-                    uint32_t start_y,
-                    const char *character)// 数组
-{
-    ui_graphic_data_struct_t*data_struct=&clientData->graphic_data_struct;
-    data_struct->graphic_tpye=UI_CHAR;
-
-    for(char i=0;i<3;i++)
-        data_struct->graphic_name[i] = name[i];	//字符索引
-    data_struct->operate_tpye=op_type;// 图层操作  1为增加
-    data_struct->layer=layer;//在第几图层
-    data_struct->color=color;//颜色
-    data_struct->start_angle=size;
-    data_struct->end_angle=length;
-    data_struct->width=width;
-    data_struct->start_x=start_x;
-    data_struct->start_y=start_y;
-    data_struct->radius = 0;
-    data_struct->end_x = 0;
-    data_struct->end_y = 0;
-
-    memcpy(clientData->data,character,30);
-}
-
-/**
- * 绘制腹图像
- * @param graphic
- * @param name
- * @param operate_tpye
- * @param graphic_tpye
- * @param layer
- * @param color
- * @param start_angle
- * @param end_angle
- * @param width
- * @param start_x
- * @param start_y
- * @param radius
- * @param end_x
- * @param end_y
- */
-void Figure_Graphic(ui_graphic_data_struct_t* graphic,//最终要发出去的数组的数据段内容
-                    const char* name,
-                    uint32_t operate_tpye,
-                    uint32_t graphic_tpye,//绘制什么图像
-                    uint32_t layer,
-                    uint32_t color,
-                    uint32_t start_angle,
-                    uint32_t end_angle,
-                    uint32_t width,
-                    uint32_t start_x,
-                    uint32_t start_y,
-                    uint32_t radius,
-                    uint32_t end_x,
-                    uint32_t end_y)
-{
-    for(char i=0;i<3;i++)
-        graphic->graphic_name[i] = name[i];	//字符索引
-    graphic->operate_tpye = operate_tpye; //图层操作
-    graphic->graphic_tpye = graphic_tpye;         //Char型
-    graphic->layer        = layer;//都在第一层
-    graphic->color        = color;//变色
-    graphic->start_angle  = start_angle;
-    graphic->end_angle    = end_angle;
-    graphic->width        = width;
-    graphic->start_x      = start_x;
-    graphic->start_y      = start_y;
-    graphic->radius = radius;
-    graphic->end_x  = end_x;
-    graphic->end_y  = end_y;
-}
-
-/**
- * 绘制浮点数
- * @param graphic
- * @param name
- * @param operate_tpye
- * @param graphic_tpye
- * @param layer
- * @param color
- * @param size
- * @param decimal
- * @param width
- * @param start_x
- * @param start_y
- * @param number
- */
-void Float_Graphic(ui_graphic_data_struct_t* graphic,//最终要发出去的数组的数据段内容
-                   const char* name,
-                   uint32_t operate_tpye,
-                   uint32_t graphic_tpye,//绘制什么图像
-                   uint32_t layer,
-                   uint32_t color,
-                   uint32_t size,
-                   uint32_t decimal,
-                   uint32_t width,
-                   uint32_t start_x,
-                   uint32_t start_y,
-                   float number)
-{
-    for(char i=0;i<3;i++)
-        graphic->graphic_name[i] = name[i];	//字符索引
-    graphic->operate_tpye = operate_tpye; //图层操作
-    graphic->graphic_tpye = graphic_tpye;
-    graphic->layer        = layer;//
-    graphic->color        = color;//变色
-    graphic->start_angle  = size;
-    graphic->end_angle    = decimal;//小数有效位
-    graphic->width        = width;
-    graphic->start_x      = start_x;
-    graphic->start_y      = start_y;
-    graphic->number       = number*1000;//浮点类型的要成1000后转换为一个int32类型的
-}
-
-/**
- * 绘制整形
- * @param graphic
- * @param name
- * @param operate_tpye
- * @param graphic_tpye
- * @param layer
- * @param color
- * @param size
- * @param zero
- * @param width
- * @param start_x
- * @param start_y
- * @param number
- */
-void Int_Graphic(ui_graphic_data_struct_t* graphic,//最终要发出去的数组的数据段内容
-                 const char* name,
-                 uint32_t operate_tpye,
-                 uint32_t graphic_tpye,//绘制什么图像
-                 uint32_t layer,
-                 uint32_t color,
-                 uint32_t size,
-                 uint32_t zero,
-                 uint32_t width,
-                 uint32_t start_x,
-                 uint32_t start_y,
-                 int32_t number)
-{
-    for(char i=0;i<3;i++)
-        graphic->graphic_name[i] = name[i];	//字符索引
-    graphic->operate_tpye = operate_tpye; //图层操作
-    graphic->graphic_tpye = graphic_tpye;
-    graphic->layer        = layer;//都在第一层
-    graphic->color        = color;//变色
-    graphic->start_angle  = size;
-    graphic->end_angle    = zero;
-    graphic->width        = width;
-    graphic->start_x      = start_x;
-    graphic->start_y      = start_y;
-    graphic->number       = number;
-}
-
-void one_layer_draw()
-{
-    ext_graphic_seven_data_t ui_aim_line;//发送变量,七个数据段
-
-    //裁判通信帧头处理
-    ui_aim_line.txFrameHeader.SOF=REFREE_HEADER_SOF;
-    ui_aim_line.txFrameHeader.data_length=sizeof (ext_student_interactive_header_data_t)+
-                                          sizeof(ui_graphic_data_struct_t)*7;
-    ui_aim_line.txFrameHeader.seq=0;
-    memcpy(ClientTxBuffer,&ui_aim_line.txFrameHeader,sizeof(frame_header_struct_t));
-    //CRC8
-    append_CRC8_check_sum(ClientTxBuffer,sizeof(frame_header_struct_t));
-    ui_aim_line.CmdID= Referee_ID_robot_interactive_header_data;
-
-    //数据帧头
-    ui_aim_line.dataFrameHeader.send_ID=Referee.GameRobotStat.robot_id;
-    ui_aim_line.dataFrameHeader.receiver_ID=Referee.SelfClient;
-    ui_aim_line.dataFrameHeader.data_cmd_id=UI_INTERACT_ID_draw_seven_graphic;
-
-    //数据内容
-    //将画图的内容赋值到的xxx_data_struct中
-    Figure_Graphic(&ui_aim_line.clientData[0],"LI1",static_update_flag,UI_LINE,UI_ONE_LAYER,UI_YELLOW,
-                   0,0,2,1920/2-80,1080/2-80,
-                   0,1920/2+80,1080/2-80);
-    Figure_Graphic(&ui_aim_line.clientData[1],"LI2",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2-60,1080/2-120,
-                   0,1920/2+60,1080/2-120);
-    Figure_Graphic(&ui_aim_line.clientData[2],"LI3",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2-40,1080/2-160,
-                   0,1920/2+40,1080/2-160);
-    Figure_Graphic(&ui_aim_line.clientData[3],"LI4",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2-20,1080/2-200,
-                   0,1920/2+20,1080/2-200);
-    Figure_Graphic(&ui_aim_line.clientData[4],"LI5",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2-10,1080/2-240,
-                   0,1920/2+10,1080/2-240);
-    Figure_Graphic(&ui_aim_line.clientData[5],"LI6",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2,1080/2-40,
-                   0,1920/2,1080/2-240);
-    Figure_Graphic(&ui_aim_line.clientData[6],"LI7",static_update_flag,UI_LINE,
-                   UI_ONE_LAYER,UI_YELLOW,0,0,2,1920/2-100,1080/2-40,
-                   0,1920/2+100,1080/2-40);
-
-    //将除帧头部分放入缓冲区
-    memcpy(ClientTxBuffer+Referee_LEN_FRAME_HEAD,(uint8_t *)&ui_aim_line.CmdID,sizeof(ui_aim_line));
-    //帧尾CRC16处理
-    append_CRC16_check_sum(ClientTxBuffer,sizeof(ui_aim_line));
-    //串口发送
-    usart6_tx_dma_enable(ClientTxBuffer,sizeof(ui_aim_line));
-}
-
-
-
-void cap_percentage_draw_init()
-{
-    ext_graphic_two_data_t ui_cap_percentage;//两个数据段
-    //帧头处理
-    ui_cap_percentage.txFrameHeader.SOF=REFREE_HEADER_SOF;
-    ui_cap_percentage.txFrameHeader.data_length=sizeof (ext_student_interactive_header_data_t)+
-                                                sizeof(ui_graphic_data_struct_t)*2;
-    ui_cap_percentage.txFrameHeader.seq=0;
-
-    memcpy(ClientTxCapBuffer,&ui_cap_percentage.txFrameHeader,sizeof(frame_header_struct_t));
-    //CRC8校验
-    append_CRC8_check_sum(ClientTxCapBuffer,sizeof(frame_header_struct_t));
-    //数据帧头处理
-    ui_cap_percentage.CmdID= Referee_ID_robot_interactive_header_data;
-    ui_cap_percentage.dataFrameHeader.send_ID=Referee.GameRobotStat.robot_id;
-    ui_cap_percentage.dataFrameHeader.receiver_ID=Referee.SelfClient;
-    ui_cap_percentage.dataFrameHeader.data_cmd_id=UI_INTERACT_ID_draw_two_graphic;
-    //数据填充
-    //能量边框
-    Figure_Graphic(&ui_cap_percentage.clientData[0],"CFL",UI_ADD,UI_RECTANGLE,
-                   UI_FOUR_LAYER,UI_WHITE,0,0,10,834,109,0, 1059, 143);//放在第四图层
-    //能量条,初始状态是满的
-    Figure_Graphic(&ui_cap_percentage.clientData[1],"CAC",UI_ADD,UI_LINE,
-                   UI_FOUR_LAYER,UI_GREEN,0,0, 20,839,125,0,1055,125);
-    //CRC18校验
-    memcpy(ClientTxCapBuffer+Referee_LEN_FRAME_HEAD,(uint8_t *)&ui_cap_percentage.CmdID,sizeof(ui_cap_percentage));
-    append_CRC16_check_sum(ClientTxCapBuffer,sizeof(ui_cap_percentage));
-    usart6_tx_dma_enable(ClientTxCapBuffer,sizeof(ui_cap_percentage));
-    osDelay(100);
-}
-float asc=0.0;
-float ant = 0;
-//extern cap_receive_data_t  capReceiveData;
-void dynamic_cap_percentage_draw()
-{
-    ext_graphic_two_data_t ui_cap_percentage;//两个数据段
-    //帧头处理
-    ui_cap_percentage.txFrameHeader.SOF=REFREE_HEADER_SOF;
-    ui_cap_percentage.txFrameHeader.data_length=sizeof (ext_student_interactive_header_data_t)+
-                                                sizeof(ui_graphic_data_struct_t)*2;
-    ui_cap_percentage.txFrameHeader.seq=0;
-
-    memcpy(ClientTxCapBuffer,&ui_cap_percentage.txFrameHeader,sizeof(frame_header_struct_t));
-    //CRC8校验
-    append_CRC8_check_sum(ClientTxCapBuffer,sizeof(frame_header_struct_t));
-    //数据帧头处理
-    ui_cap_percentage.CmdID= Referee_ID_robot_interactive_header_data;
-    ui_cap_percentage.dataFrameHeader.send_ID=Referee.GameRobotStat.robot_id;
-    ui_cap_percentage.dataFrameHeader.receiver_ID=Referee.SelfClient;
-    ui_cap_percentage.dataFrameHeader.data_cmd_id=UI_INTERACT_ID_draw_two_graphic;
-    //数据填充
-//    int32_t real_cap = cap_percentage * 216;
-
-//    asc+=0.1;
-//    if(asc>=1){
-//        asc=0;
-//    }
-//    float real_cap=asc*216;
-//    int32_t real_cap=((HAL_GetTick()%100)/100.0)*216;
-
-    //等待修改
- //   ant = (capReceiveData.voltage_out-13.5)/(25.0-13.5)*216;
- ant=(fp32)Cap.capFeedback.esr_v/2800.0*216;
-//    if(ant == 216)
-//        ant = 0;
-//    float real_cap = cap_percentage * 216;
-    //等待修改
-    //能量边框,黄色边框代表动态模式启动了,白色代表进入加载模式
-    Figure_Graphic(&ui_cap_percentage.clientData[0],"CFL",UI_MODIFY,UI_RECTANGLE,
-                   UI_FOUR_LAYER,uiColor.ui_color,0,0,10,834,109,0, 1059, 143);//放在第四图层
-    //能量条,初始状态是满的
-    Figure_Graphic(&ui_cap_percentage.clientData[1],"CAC",UI_MODIFY,UI_LINE,
-                   UI_FOUR_LAYER,UI_GREEN,0,0, 20,839,125,0,839 + ant, 125);
-    //CRC18校验
-    memcpy(ClientTxCapBuffer+Referee_LEN_FRAME_HEAD,(uint8_t *)&ui_cap_percentage.CmdID,sizeof(ui_cap_percentage));
-    append_CRC16_check_sum(ClientTxCapBuffer,sizeof(ui_cap_percentage));
-    usart6_tx_dma_enable(ClientTxCapBuffer,sizeof(ui_cap_percentage));
-    osDelay(100);
-}
-extern bool magazine_cover_is_closed;
-//动态元素，提示颜色转换
-void dynamic_color_change()
-{
-    if(gimbal.mode == GIMBAL_AUTO )//自瞄模式，ui变紫红色
-    {
-        uiColor.auto_aim_color = UI_FUCHSIA;
-    }
-    else if(gimbal.mode == GIMBAL_BUFF )//大符
-    {
-        uiColor.auto_aim_color = UI_RED_BLUE;//红蓝
-    }
-    else if(gimbal.mode == GIMBAL_SBUFF)//小符
-    {
-        uiColor.auto_aim_color = UI_CYAN_BLUE;//蓝青色
-    }
-    else
-    {
-        uiColor.auto_aim_color = UI_GREEN;//不开启时绿色
-    }
-
-    if(chassis.mode == CHASSIS_SPIN)//小陀螺模式，ui变紫红色
-    {
-        uiColor.spin_color = UI_FUCHSIA;
-    }
-    else
-    {
-        uiColor.spin_color = UI_CYAN_BLUE;//兰青色
-    }
-
-//    if(KeyBoard.G.click_flag == 1)//按下时弹舱开，提示颜色为紫红色
-//    {
-//        uiColor.cover_color = UI_FUCHSIA;
-//    }
-    if(magazine_cover_is_closed==false)//按下时弹舱开，提示颜色为紫红色
-    {
-        uiColor.cover_color = UI_FUCHSIA;
-    }
-    else
-    {
-        uiColor.cover_color = UI_CYAN_BLUE;//兰青色
-    }
-
-//    if(launcher.fire_mode == Fire_ON)
-//    {
-//        uiColor.fire_color = UI_FUCHSIA;//摩擦轮启动后呈现紫红色
-//    }
-    if(fabs(launcher.fire_l.motor_measure->speed_rpm) > 500 && fabs(launcher.fire_r.motor_measure->speed_rpm) > 500)
-    {
-        uiColor.fire_color = UI_FUCHSIA;//摩擦轮启动后呈现紫红色
-    }
-    else
-    {
-        uiColor.fire_color = UI_CYAN_BLUE;//其他时间呈现兰青色
-    }
-
-    if(KeyBoard.V.click_flag == 0)
-    {
-        uiColor.ui_color = UI_WHITE;
-    }
-    else
-    {
-        uiColor.ui_color = UI_YELLOW;
-    }
-}
-
-void ui_aim_draw()
-{
-    ext_graphic_seven_data_t ui_aim;//三根横线，一根竖线，加一个圆，一共五个，后续添加：十字准心
-    //裁判通信帧头
-    ui_aim.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_aim.txFrameHeader.data_length = sizeof (ext_student_interactive_header_data_t) +
-                                       sizeof (ui_graphic_data_struct_t) * 7;
-    ui_aim.txFrameHeader.seq = 0;//包序号设置为0
-    memcpy(ClientTxBuffer, &ui_aim.txFrameHeader, sizeof (frame_header_struct_t));//把帧头放进去
-    //CRC8校验帧头
-    append_CRC8_check_sum(ClientTxBuffer, sizeof (frame_header_struct_t));
-    ui_aim.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_aim.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_aim.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_aim.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_seven_graphic;
-    //数据内容填充
-    //竖线
-    Figure_Graphic(&ui_aim.clientData[0], "LI1", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_YELLOW,
-                   0, 0, 2, 959, 347, 0, 961, 428);
-    //横线1
-    Figure_Graphic(&ui_aim.clientData[1], "LI2", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_YELLOW,
-                   0, 0, 2, 911, 396, 0, 1013, 398);
-    //横线2
-    Figure_Graphic(&ui_aim.clientData[2], "LI3", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_YELLOW,
-                   0, 0, 2, 932, 376, 0, 992, 376);
-    //横线3
-    Figure_Graphic(&ui_aim.clientData[3], "LI4", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_ORANGE,
-                   0, 0, 3, 945, 353, 0, 976, 353);
-    //圆型
-    Figure_Graphic(&ui_aim.clientData[4], "LI5", UI_ADD,  UI_CIRCLE, UI_ZERO_LAYER, UI_GREEN,
-                   0, 0, 5, 894, 493, 26, 0, 0);
-    //十字准心
-    Figure_Graphic(&ui_aim.clientData[5], "LI5", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_GREEN,
-                   0, 0, 2, 949, 458, 0, 973, 458);//横线
-    Figure_Graphic(&ui_aim.clientData[6], "LI6", UI_ADD, UI_LINE, UI_ZERO_LAYER, UI_GREEN,
-                   0, 0, 2, 961, 445, 0, 961, 471);//竖线
-    //把除去帧头的其他部分放进缓存区
-    memcpy(ClientTxBuffer + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_aim.CmdID, sizeof (ui_aim));
-    //帧尾使用CRC16处理
-    append_CRC16_check_sum(ClientTxBuffer, sizeof (ui_aim));
-    //串口6发送
-    usart6_tx_dma_enable(ClientTxBuffer, sizeof (ui_aim));
-    osDelay(100);
-}
-
-static void draw_static_string(ext_string_data_t* ui_string)
-{
-
-    switch (state_first_graphic)
-    {
-        case 0:
-        {
-            char first_line[30]  = {"CHASSIS:"};//
-            String_Graphic(&ui_string->clientData, "CL1", static_update_flag, UI_ZERO_LAYER, UI_PINK, 15, strlen(first_line), 2, 320,
-                           620, first_line);
-        }
+    switch (command_id) {
+        case Referee_ID_game_state:
+            COPY_REFEREE_FIELD(Referee.GameState, Referee_LEN_game_state);
             break;
-        case 1:
-        {
-            char second_line[30] = {" GIMBAL:"};//云台模式
-            String_Graphic(&ui_string->clientData, "CL2", static_update_flag, UI_ZERO_LAYER, UI_PINK, 15, strlen(second_line), 2, 320,
-                           680, second_line);
+        case Referee_ID_game_result:
+            COPY_REFEREE_FIELD(Referee.GameResult, Referee_LEN_game_result);
+            Referee.GameResult.game_over = true;
             break;
-        }
-        case 2:
-        {
-            char third_line[30]={"   FIRE:"};
-            String_Graphic(&ui_string->clientData, "CL3", static_update_flag, UI_ZERO_LAYER, UI_PINK, 15, strlen(third_line), 2, 320,
-                           740, third_line);
+        case Referee_ID_game_robot_HP:
+            COPY_REFEREE_FIELD(Referee.GameRobotHP, Referee_LEN_game_robot_HP);
             break;
-        }
-        case 3:
-        {
-            char fourth_line[30] = {"    LIP:"};
-            String_Graphic(&ui_string->clientData, "CL4", static_update_flag, UI_ZERO_LAYER, UI_PINK, 15, strlen(fourth_line), 2, 320,
-                           800, fourth_line);
+        case Referee_ID_event_data:
+            COPY_REFEREE_FIELD(Referee.EventData, Referee_LEN_event_data);
             break;
-        }
-        case 4:
-        {
-            char cap_line[30]={"CAP:"};
-            String_Graphic(&ui_string->clientData,"CAP",static_update_flag,UI_ZERO_LAYER,UI_ORANGE,15, strlen(cap_line),2,1920-550,
-                           400,cap_line);
+        case Referee_ID_supply_projectile_action:
+            COPY_REFEREE_FIELD(Referee.SupplyProjectileAction,
+                               Referee_LEN_supply_projectile_action);
             break;
-        }
+        case Referee_ID_supply_warm:
+            COPY_REFEREE_FIELD(Referee.RefereeWarning, Referee_LEN_supply_warm);
+            break;
+        case Referee_ID_dart_info:
+            COPY_REFEREE_FIELD(Referee.DartRemainingTime, Referee_LEN_dart_info);
+            break;
+        case Referee_ID_game_robot_state:
+            COPY_REFEREE_FIELD(Referee.GameRobotStat, Referee_LEN_game_robot_state);
+            break;
+        case Referee_ID_power_heat_data:
+            COPY_REFEREE_FIELD(Referee.PowerHeatData, Referee_LEN_power_heat_data);
+            break;
+        case Referee_ID_game_robot_pos:
+            COPY_REFEREE_FIELD(Referee.GameRobotPos, Referee_LEN_game_robot_pos);
+            break;
+        case Referee_ID_buff_musk:
+            COPY_REFEREE_FIELD(Referee.Buff, Referee_LEN_buff_musk);
+            break;
+        case Referee_ID_aerial_robot_energy:
+            COPY_REFEREE_FIELD(Referee.AerialRobotEnergy, Referee_LEN_aerial_robot_energy);
+            break;
+        case Referee_ID_robot_hurt:
+            COPY_REFEREE_FIELD(Referee.RobotHurt, Referee_LEN_robot_hurt);
+            Referee.RobotHurt.being_hurt = true;
+            break;
+        case Referee_ID_shoot_data:
+            COPY_REFEREE_FIELD(Referee.ShootData, Referee_LEN_shoot_data);
+            break;
+        case Referee_ID_bullet_remaining:
+            COPY_REFEREE_FIELD(Referee.BulletRemaining, Referee_LEN_bullet_remaining);
+            break;
+        case Referee_ID_rfid_status:
+            COPY_REFEREE_FIELD(Referee.RfidStatus, Referee_LEN_rfid_status);
+            break;
+        case Referee_ID_dart_client_directive:
+            COPY_REFEREE_FIELD(Referee.DartClient, Referee_LEN_dart_client_directive);
+            break;
+        case Referee_ID_dart_all_robot_position:
+            COPY_REFEREE_FIELD(Referee.RobotPosition, Referee_LEN_dart_all_robot_position);
+            break;
+        case Referee_ID_radar_mark:
+            COPY_REFEREE_FIELD(Referee.RadarMark, Referee_LEN_radar_mark);
+            break;
+        case Referee_ID_entry_info:
+            COPY_REFEREE_FIELD(Referee.SentryInfo, Referee_LEN_entry_info);
+            break;
+        case Referee_ID_radar_info:
+            COPY_REFEREE_FIELD(Referee.RadarInfo, Referee_LEN_radar_info);
+            break;
+        case Referee_ID_robot_interactive_header_data:
+            COPY_REFEREE_FIELD(Referee.StudentInteractive,
+                               Referee_LEN_robot_interactive_header_data);
+            break;
+        case Referee_ID_map_command:
+            COPY_REFEREE_FIELD(Referee.MapCommand, Referee_LEN_map_command);
+            break;
+        case Referee_ID_keyboard_information:
+            COPY_REFEREE_FIELD(Referee.keyboard, Referee_LEN_keyboard_information);
+            break;
+        case Referee_ID_robot_map_robot_data:
+            COPY_REFEREE_FIELD(Referee.EnemyPosition, Referee_LEN_robot_map_robot_data);
+            break;
+        case Referee_ID_robot_custom_client:
+            COPY_REFEREE_FIELD(Referee.Custom, Referee_LEN_robot_custom_client);
+            break;
+        case Referee_ID_robot_entry_info_receive:
+            COPY_REFEREE_FIELD(Referee.SentryMapData, Referee_LEN_robot_entry_info_receive);
+            break;
+        case Referee_ID_robot_custom_info_receive:
+            COPY_REFEREE_FIELD(Referee.SendData, Referee_LEN_robot_custom_info_receive);
+            break;
         default:
+            /* 合法但当前版本未知的命令不影响整批后续帧解析。 */
             break;
     }
+    return true;
 }
 
-void ui_string_draw()
+#undef COPY_REFEREE_FIELD
+
+/**
+ * @brief 排空并解析当前所有裁判接收批次。
+ *
+ * 一个接收批次可包含多帧。只要批次中存在合法帧，就更新时间并重新发布裁判状态主题。
+ */
+void referee_decode_pending(void)
 {
-    ext_string_data_t ui_string;//选对结构体
-    int draw_time = 8;
-    //裁判系统通信帧头
-    ui_string.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_string.txFrameHeader.data_length = UI_LEN_INTERACT_draw_char_graphic;//帧头长度
-    ui_string.txFrameHeader.seq = 0;//包序号
-    memcpy(ClientTxBufferChar, &ui_string.txFrameHeader, sizeof (frame_header_struct_t));//帧头放入
-    //CRC8校验
-    append_CRC8_check_sum(ClientTxBufferChar, sizeof (frame_header_struct_t));
-    ui_string.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_string.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_string.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_string.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_char_graphic;
-    //数据内容填充,循环填充并发送
-    while(draw_time-- >= 0)
-    {
-        switch (draw_time)
-        {
-            case 0:
-            {
+    static referee_rx_frame_t frame;
+    while (referee_rx_queue != NULL &&
+           xQueueReceive(referee_rx_queue, &frame, 0U) == pdTRUE) {
+        uint16_t offset = 0U;
+        bool batch_contains_valid_frame = false;
 
-                char cover[30] = {"SPIN"};//陀螺字符提示
-                String_Graphic(&ui_string.clientData, "CO1", UI_ADD, UI_ONE_LAYER, UI_CYAN_BLUE, 15, strlen(cover),
-                               2, 382, 775, cover);
-            }
+        /* 一次串口空闲中断可能包含多帧，按每帧头部声明长度顺序解析。 */
+        while ((uint16_t)(frame.length - offset) >=
+               (Referee_LEN_FRAME_HEAD + Referee_LEN_CMD_ID + Referee_LEN_FRAME_TAIL)) {
+            const uint16_t payload_length =
+                (uint16_t)frame.data[offset + DATA_LENGTH] |
+                ((uint16_t)frame.data[offset + DATA_LENGTH + 1U] << 8U);
+            const uint16_t packet_length =
+                (uint16_t)(Referee_LEN_FRAME_HEAD + Referee_LEN_CMD_ID +
+                           payload_length + Referee_LEN_FRAME_TAIL);
+            if (packet_length > (uint16_t)(frame.length - offset) ||
+                packet_length > REFEREE_BUFFER_SIZE) {
                 break;
-
-            case 1:
-            {
-                char spin[30] = {"COVER"};//弹舱字符提示
-                String_Graphic(&ui_string.clientData, "SP1", UI_ADD, UI_ONE_LAYER, UI_CYAN_BLUE, 15, strlen(spin),
-                               2, 366, 648, spin);
             }
-                break;
-
-            case 3:
-            {
-                char Sauto[30] = {"AUTO"};//自瞄模式,字符呈现紫红色
-                String_Graphic(&ui_string.clientData, "BU1", UI_ADD, UI_ONE_LAYER, UI_FUCHSIA, 13, strlen(Sauto),
-                               3, 707, 747, Sauto);//字符提示
+            if (referee_read_frame(&frame.data[offset], packet_length)) {
+                batch_contains_valid_frame = true;
             }
-                break;
-
-            case 4:
-            {
-                char sbuff[30] = {"SBUFF"};//打符，大符，红蓝配色
-                String_Graphic(&ui_string.clientData, "BU2", UI_ADD, UI_ONE_LAYER, UI_RED_BLUE, 13, strlen(sbuff),
-                               3, 844, 747, sbuff);//字符提示
-            }
-                break;
-
-            case 5:
-            {
-                char buff[30] = {"BUFF"};//小符，兰青配色
-                String_Graphic(&ui_string.clientData, "BU3", UI_ADD, UI_ONE_LAYER, UI_CYAN_BLUE, 13, strlen(buff),
-                               3, 966, 747, buff);//字符提示
-            }
-                break;
-
-            case 6:
-            {
-                char fire[30] = {"FIRE"};//摩擦轮提示
-                String_Graphic(&ui_string.clientData, "FIR", UI_ADD, UI_ONE_LAYER, UI_CYAN_BLUE, 15, strlen(fire),
-                               3, 500, 848, fire);
-            }
-
-            default:
-                break;
+            offset = (uint16_t)(offset + packet_length);
         }
-        //除去帧头部分放入缓存区
-        memcpy(ClientTxBufferChar + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_string.CmdID, sizeof (ui_string));
-        //帧尾CRC16处理
-        append_CRC16_check_sum(ClientTxBufferChar, sizeof (ui_string));
-        //发送
-        usart6_tx_dma_enable(ClientTxBufferChar, sizeof (ui_string));
-        osDelay(100);
+
+        if (!batch_contains_valid_frame) {
+            continue;
+        }
+
+        referee_last_update_ms = HAL_GetTick();
+        update_launch_permission();
+        update_launch_window();
+        update_door_status();
+
+        /* 只发布状态机真正需要的裁判字段，隔离庞大的协议结构。 */
+        const referee_status_t status = {
+            .launch_granted = launch_grant,
+            .launch_window = dart_launch_mode == 0x01U ? 1U :
+                             dart_launch_mode == 0x02U ? 2U : 0U,
+            .door_status = dart_progress_mod,
+            .timestamp_ms = referee_last_update_ms,
+        };
+        (void)topic_publish(TOPIC_REFEREE_STATUS, &status);
     }
 }
 
-void ui_auto_aim_fire_init()
+/**
+ * @brief 根据比赛阶段、发射口状态和倒计时计算当前发射许可。
+ *
+ * 任何禁止比赛阶段或末段保护条件都会覆盖先前结果并强制撤销许可。
+ */
+static void update_launch_permission(void)
 {
-    ext_graphic_two_data_t ui_auto;//一次发两个
+    /*
+     * 只有比赛进行阶段、官方发射口处于允许状态且倒计时位于有效区间时才授权。
+     * 阶段剩余时间不足十秒或比赛处于准备、结算等阶段时强制撤销授权。
+     */
+    launch_grant = Referee.DartClient.dart_launch_opening_status == 0U &&
+                   Referee.GameState.game_progress == 4U &&
+                   Referee.DartRemainingTime.dart_remaining_time > 0U &&
+                   Referee.DartRemainingTime.dart_remaining_time <= 30U;
 
-    //裁判系统帧头
-    ui_auto.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_auto.txFrameHeader.data_length = sizeof(ext_student_interactive_header_data_t) +
-                                        sizeof (ui_graphic_data_struct_t) * 2;
-    ui_auto.txFrameHeader.seq = 0;//包序号
-    memcpy(ClientTxBufferRect, &ui_auto.txFrameHeader, sizeof (frame_header_struct_t));//将帧头放入
-    //CRC8校验
-    append_CRC8_check_sum(ClientTxBufferRect, sizeof (frame_header_struct_t));
-    ui_auto.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_auto.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_auto.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_auto.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_two_graphic;//绘制两个图形
-    //数据填充
-    //第一是提示方框
-    Figure_Graphic(&ui_auto.clientData[0], "RC1", UI_ADD, UI_RECTANGLE, UI_TWO_LAYER, UI_GREEN,
-                   0, 0, 2, 687, 264, 0, 1230, 709);//方框提示
-    //第二是摩擦轮圆圈
-    Figure_Graphic(&ui_auto.clientData[1], "FI1", UI_ADD, UI_CIRCLE, UI_TWO_LAYER, UI_CYAN_BLUE,
-                   0, 0, 6, 632, 848, 42, 0, 0);//摩擦轮圆圈提示
-
-    //去除帧头部分，其他放入缓存区
-    memcpy(ClientTxBufferRect + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_auto.CmdID, sizeof (ui_auto));
-    //CRC16校验
-    append_CRC16_check_sum(ClientTxBufferRect, sizeof(ui_auto));
-    //串口发送
-    usart6_tx_dma_enable(ClientTxBufferRect, sizeof(ui_auto));
-    osDelay(100);
-}
-
-void dynamic_auto_fire_draw()
-{
-    ext_graphic_two_data_t ui_auto;
-    //裁判系统帧头
-    ui_auto.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_auto.txFrameHeader.data_length = sizeof(ext_student_interactive_header_data_t) +
-                                        sizeof (ui_graphic_data_struct_t) * 2;
-    ui_auto.txFrameHeader.seq = 0;//包序号
-    memcpy(ClientTxBufferRect, &ui_auto.txFrameHeader, sizeof (frame_header_struct_t));//将帧头放入
-    //CRC8校验
-    append_CRC8_check_sum(ClientTxBufferRect, sizeof (frame_header_struct_t));
-    ui_auto.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_auto.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_auto.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_auto.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_two_graphic;
-    //数据填充
-    Figure_Graphic(&ui_auto.clientData[0], "RC1", UI_MODIFY, UI_RECTANGLE, UI_TWO_LAYER, uiColor.auto_aim_color,
-                   0, 0, 2, 687, 264, 0, 1230, 709);//图形修改
-    Figure_Graphic(&ui_auto.clientData[1], "FI1", UI_MODIFY, UI_CIRCLE, UI_TWO_LAYER, uiColor.fire_color,
-                   0, 0, 6, 632, 848, 42, 0, 0);//颜色变化
-    //去除帧头部分，其他放入缓存区
-    memcpy(ClientTxBufferRect + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_auto.CmdID, sizeof (ui_auto));
-    //CRC16校验
-    append_CRC16_check_sum(ClientTxBufferRect, sizeof(ui_auto));
-    //串口发送
-    usart6_tx_dma_enable(ClientTxBufferRect, sizeof(ui_auto));
-    osDelay(100);
-}
-
-void ui_cover_draw_init()//旋转跟弹舱一起
-{
-    ext_graphic_two_data_t ui_cover_spin;
-    //裁判系统帧头
-    ui_cover_spin.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_cover_spin.txFrameHeader.data_length = sizeof (ext_student_interactive_header_data_t) +
-                                              sizeof(ui_graphic_data_struct_t ) * 2;
-    ui_cover_spin.txFrameHeader.seq = 0;//包序号
-    memcpy(ClientTXBufferCir, &ui_cover_spin.txFrameHeader, sizeof (frame_header_struct_t));
-    //CRC8校验
-    append_CRC8_check_sum(ClientTXBufferCir, sizeof(frame_header_struct_t));
-    ui_cover_spin.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_cover_spin.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_cover_spin.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_cover_spin.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_two_graphic;
-    //数据填充
-    Figure_Graphic(&ui_cover_spin.clientData[0], "CO2", UI_ADD, UI_CIRCLE, UI_THREE_LAYER, UI_CYAN_BLUE,
-                   0, 0, 6, 523, 643, 42, 0, 0);
-    Figure_Graphic(&ui_cover_spin.clientData[1], "SP2", UI_ADD, UI_CIRCLE, UI_THREE_LAYER, UI_CYAN_BLUE,
-                   0, 0, 6, 543, 760, 42, 0, 0);
-    //去除帧头部分，其他放入缓存区
-    memcpy(ClientTXBufferCir + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_cover_spin.CmdID, sizeof (ui_cover_spin));
-    //CRC16校验
-    append_CRC16_check_sum(ClientTXBufferCir, sizeof(ui_cover_spin));
-    //串口发送
-    usart6_tx_dma_enable(ClientTXBufferCir, sizeof(ui_cover_spin));
-    osDelay(100);
-}
-
-void dynamic_spin_cover_draw()
-{
-    ext_graphic_two_data_t ui_cover_spin;
-    //裁判系统帧头
-    ui_cover_spin.txFrameHeader.SOF = REFREE_HEADER_SOF;
-    ui_cover_spin.txFrameHeader.data_length = sizeof (ext_student_interactive_header_data_t) +
-                                              sizeof(ui_graphic_data_struct_t ) * 2;
-    ui_cover_spin.txFrameHeader.seq = 0;//包序号
-    memcpy(ClientTXBufferCir, &ui_cover_spin.txFrameHeader, sizeof (frame_header_struct_t));
-    //CRC8校验
-    append_CRC8_check_sum(ClientTXBufferCir, sizeof(frame_header_struct_t));
-    ui_cover_spin.CmdID = Referee_ID_robot_interactive_header_data;
-    //数据帧头
-    ui_cover_spin.dataFrameHeader.send_ID = Referee.GameRobotStat.robot_id;
-    ui_cover_spin.dataFrameHeader.receiver_ID = Referee.SelfClient;
-    ui_cover_spin.dataFrameHeader.data_cmd_id = UI_INTERACT_ID_draw_two_graphic;
-    //数据填充
-    Figure_Graphic(&ui_cover_spin.clientData[0], "CO2", UI_MODIFY, UI_CIRCLE, UI_THREE_LAYER, uiColor.cover_color,
-                   0, 0, 6, 523, 643, 42, 0, 0);
-    Figure_Graphic(&ui_cover_spin.clientData[1], "SP2", UI_MODIFY, UI_CIRCLE, UI_THREE_LAYER, uiColor.spin_color,
-                   0, 0, 6, 543, 760, 42, 0, 0);
-    //去除帧头部分，其他放入缓存区
-    memcpy(ClientTXBufferCir + Referee_LEN_FRAME_HEAD, (uint8_t*)&ui_cover_spin.CmdID, sizeof (ui_cover_spin));
-    //CRC16校验
-    append_CRC16_check_sum(ClientTXBufferCir, sizeof(ui_cover_spin));
-    //串口发送
-    usart6_tx_dma_enable(ClientTXBufferCir, sizeof(ui_cover_spin));
-    osDelay(100);//10Hz发送频率
-}
-
-_Noreturn void UI_paint_task(void const*argument)
-{
-    vTaskDelay(20);
-    //osDelay(100);
-    while(1)
-    {
-        if(KeyBoard.V.click_flag == 0)
-        {
-            ui_aim_draw();//辅助瞄准线
-
-            ui_auto_aim_fire_init();//自瞄提示和摩擦轮开启提示初始化
-
-            ui_cover_draw_init();//旋转与弹舱提示初始化
-
-            ui_string_draw();//画字符
-
-            cap_percentage_draw_init();//电容百分比显示
-
-            dynamic_color_change();//更新动态元素信息
-
-            dynamic_cap_percentage_draw();//电容百分比修改
-        }
-        else
-        {
-            dynamic_color_change();//动态元素变化获取
-
-            dynamic_auto_fire_draw();//自瞄提示和摩擦轮开启提示
-
-            dynamic_spin_cover_draw();//旋转与弹舱提示
-
-            dynamic_cap_percentage_draw();//电容百分比修改
-        }
-    }
-}
-
-//判断比赛是否开启
-void dart_launch()
-{
-    if (Referee.DartClient.dart_launch_opening_status==0&&Referee.GameState.game_progress==4
-        &&Referee.DartRemainingTime.dart_remaining_time>0&&Referee.DartRemainingTime.dart_remaining_time<=30) {
-        launch_grant = true;
-    }else {
+    if ((Referee.GameState.stage_remain_time < 10U &&
+         Referee.GameState.game_progress == 4U) ||
+        Referee.GameState.game_progress == 1U ||
+        Referee.GameState.game_progress == 2U ||
+        Referee.GameState.game_progress == 3U ||
+        Referee.GameState.game_progress == 5U) {
         launch_grant = false;
     }
-
-    if((Referee.GameState.stage_remain_time<10&&Referee.GameState.game_progress==4)||
-       (Referee.GameState.game_progress==1||Referee.GameState.game_progress==2||
-        Referee.GameState.game_progress==3||Referee.GameState.game_progress==5))
-    {
-        launch_grant=false;
-    }
 }
 
-//判断舱门是否开启
-uint8_t dart_launch_mode = 0xFF;
-uint8_t dart_launch_cnt; //开舱门发射次数
-uint8_t dart_launch_sephr;
-void dart_launch_set()
+/**
+ * @brief 根据倒计时和已完成发数识别第一或第二发射窗口。
+ *
+ * 倒计时末三秒只计数一次，离开许可窗口后才允许下一窗口重新计数。
+ */
+static void update_launch_window(void)
 {
-    if (Referee.DartRemainingTime.dart_remaining_time <= 3 && launch_grant) {
-        if (!dart_launch_sephr) {
-            dart_launch_cnt++;
-            dart_launch_sephr = 1;
+    /* 倒计时末三秒只对当前发射窗口计数一次。 */
+    if (Referee.DartRemainingTime.dart_remaining_time <= 3U && launch_grant) {
+        if (!dart_launch_counted) {
+            dart_launch_count++;
+            dart_launch_counted = true;
         }
         return;
     }
-    if (Referee.DartRemainingTime.dart_remaining_time <= 30 && Referee.DartRemainingTime.dart_remaining_time >= 3 && launch_grant) {
 
-        if (dart_goal_set.launcherable_num <= 1) {
-            dart_launch_mode = 0x01;
-        }else if (dart_goal_set.launcherable_num >= 2 && dart_launch_cnt) {
-            dart_launch_mode = 0x02;
+    /* 离开发射窗口后允许下一窗口再次计数。 */
+    if (!launch_grant) {
+        dart_launch_counted = false;
+    }
+
+    if (Referee.DartRemainingTime.dart_remaining_time >= 3U &&
+        Referee.DartRemainingTime.dart_remaining_time <= 30U &&
+        launch_grant) {
+        if (dart_goal_set.launcherable_num <= 1U) {
+            dart_launch_mode = 0x01U;
+        } else if (dart_goal_set.launcherable_num >= 2U && dart_launch_count > 0U) {
+            dart_launch_mode = 0x02U;
         }
-    }else {
-        dart_launch_mode = 0xff;
+    } else {
+        dart_launch_mode = 0xFFU;
     }
 }
 
-
-//判断舱门状态
-uint8_t dart_progress_mod = 0x01;//记得改
-void dart_progress_get() {
-    if (Referee.DartClient.dart_launch_opening_status == 2 || Referee.DartClient.dart_launch_opening_status == 0) {
-        dart_progress_mod = 0x01;
-    }else {
-        dart_progress_mod = 0xff;
-    }
+/** @brief 把官方发射口原始状态归一化为业务层可用或不可用状态。 */
+static void update_door_status(void)
+{
+    /* 零或二表示官方发射口处于本系统认可的可用状态，其余值统一视为不可用。 */
+    const uint8_t opening = Referee.DartClient.dart_launch_opening_status;
+    dart_progress_mod = (opening == 0U || opening == 2U) ? 0x01U : 0xFFU;
 }

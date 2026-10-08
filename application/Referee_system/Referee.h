@@ -1,7 +1,9 @@
-//
-// Created by xhuanc on 2021/10/23.
-// Update by zxk on 2024/3/12
-//
+/*
+ * 裁判系统协议数据定义
+ * --------------------
+ * 结构体布局严格对应官方串口协议，修改字段顺序或位宽前必须同步核对当赛季协议文档。
+ * 业务层不得直接依赖这些庞大结构，应由 Referee.c 提取所需字段后发布裁判状态主题。
+ */
 
 #ifndef _REFEREE_H_
 #define _REFEREE_H_
@@ -29,7 +31,7 @@ typedef enum
     DATA                 = 7,
 }RefereeFrameOffset;
 
-// frame_header 格式
+// 帧头内部字段的字节偏移。
 typedef enum
 {
     SOF          = 0,//起始位
@@ -72,7 +74,7 @@ typedef enum
 //    Referee_ID_game_result                  = 0x0002,
 //    Referee_ID_game_robot_survivors       	= 0x0003,//比赛机器人存活数据
 //    Referee_ID_game_dart_state              = 0x0004, //飞镖发射状态
-//    Referee_ID_game_buff                    = 0x0005,//buff
+//    Referee_ID_game_buff                    = 0x0005,//增益状态
 //    Referee_ID_event_data  					= 0x0101,//场地事件数据
 //    Referee_ID_supply_projectile_action   	= 0x0102,//场地补给站动作标识数据
 //    Referee_ID_supply_warm 	                = 0x0104,//裁判系统警告数据
@@ -103,7 +105,7 @@ typedef enum
 //    Referee_ID_game_robot_survivors       	= 0x0003,//比赛机器人存活数据->机器人血量数据
     Referee_ID_game_robot_HP       	        = 0x0003,//比赛机器人存活数据->机器人血量数据
 //    Referee_ID_game_dart_state              = 0x0004,//飞镖发射状态  删除
-//    Referee_ID_game_buff                    = 0x0005,//buff        删除
+//    Referee_ID_game_buff                    = 0x0005,//增益状态，已删除
 
     Referee_ID_event_data  					= 0x0101,//场地事件数据
     Referee_ID_supply_projectile_action   	= 0x0102,//场地补给站动作标识数据
@@ -142,12 +144,12 @@ typedef enum
 //裁判系统各命令的数据长度
 typedef enum
 {
-    /* Std */
+    /* 固定帧头与帧尾长度。 */
     Referee_LEN_FRAME_HEAD 	                    = 5,	// 帧头长度
     Referee_LEN_CMD_ID 		                    = 2,	// 命令码长度
     Referee_LEN_FRAME_TAIL 	                    = 2,	// 帧尾CRC16
     // 帧尾CRC16
-    /* Ext */
+    /* 各命令载荷长度。 */
 
     Referee_LEN_game_state       				=  11,	//0x0001
     Referee_LEN_game_result       				=  1,	//0x0002
@@ -281,7 +283,7 @@ typedef  struct
 //} __packed ext_dart_status_t;
 
 //V1.6.1删除
-///* ID: 0x0005  Byte:  11    buff */
+///* 命令号：0x0005，载荷十一字节，增益状态。 */
 //typedef  struct
 //{
 //    uint8_t F1_zone_status:1;
@@ -499,7 +501,7 @@ typedef  struct
 //    uint16_t operate_launch_cmd_time;  //最近一次操作手确定发射指令时的比赛剩余时间，单位秒
 //}__packed ext_dart_client_cmd_t; //LEN_DART_CLIENT_DIRECTIVE  表3-19
 
-/* ID:  0x020A  Byte:6   	 */
+/* 命令号：0x020A，载荷六字节。 */
 typedef  struct
 {
     uint8_t dart_launch_opening_status;     //飞镖发射状态 0 已经开启, 1 关闭, 2 正在开启或者关闭中,
@@ -509,7 +511,7 @@ typedef  struct
 }__packed ext_dart_client_cmd_t;
 
 //V1.6.1新增 24赛季自动控制
-/* ID:   0x020B  Byte:40   	 */
+/* 命令号：0x020B，载荷四十字节。 */
 typedef  struct
 {
     float hero_x;
@@ -741,8 +743,7 @@ typedef struct judge_info_struct {
 	交互数据 机器人间通信：0x0301。
 	发送频率：数据上下行合计带宽不超过 5000 Byte。 上下行发送频率分别不超过30Hz。
  * +------+------+-------------+------------------------------------+
- * | byte | size |    breif    |            note                    |
- * |offset|      |             |                                    |
+ * | 字节偏移 | 大小 | 字段简介 | 说明 |
  * +------+------+-------------+------------------------------------+
  * |  0   |  2   | 	 data_ID   | 0x0200~0x02FF,可以在这些 ID 段选取 |
  * |      |      |             | 具体ID含义由参赛队自定义           |
@@ -921,7 +922,7 @@ typedef enum
     UI_ALL_delete     = 2
 }Delete_Graphic_Operate;//ext_client_custom_graphic_delete_t：uint8_t operate_type
 
-//bit 0-2
+// 第零位至第二位。
 typedef enum
 {
     UI_NONE   = 0,/*空操作*/
@@ -931,7 +932,7 @@ typedef enum
 }Graphic_Operate;//graphic_data_struct_t：uint32_t operate_tpye
 /*图层操作*/
 
-//bit3-5
+// 第三位至第五位。
 /*图层类型*/
 typedef enum
 {
@@ -1118,18 +1119,28 @@ typedef  struct
 //    five_countdown,
 //
 //};
-extern ui_robot_status_t ui_robot_status;
+/* 完整协议快照，仅供协议解析和现场调试使用。 */
 extern Referee_info_t Referee;
-extern void referee_task(void const*argument);
-void dart_launch();
-
-
-_Noreturn extern void UI_paint_task(void const*argument);
+/* 串口六的直接存储器访问接收区。 */
 extern uint8_t usart6_buf[REFEREE_BUFFER_SIZE];
-extern uint8_t usart1_buf[REFEREE_BUFFER_SIZE];
-
+/* 从协议快照派生出的兼容观察值；新业务应订阅裁判状态主题。 */
 extern bool launch_grant;
 extern uint8_t dart_launch_mode;
-extern  uint8_t dart_progress_mod;
+extern uint8_t dart_progress_mod;
+extern volatile uint32_t referee_last_update_ms;
+/**
+ * @brief 创建裁判静态接收队列并启动串口直接存储器访问接收。
+ *
+ * 函数保持幂等，只建立传输资源，不解析协议帧。应在 DecodeTask 初始化阶段调用。
+ */
+void referee_transport_init(void);
 
-#endif //DEMO1_REFEREE_H
+/**
+ * @brief 在 DecodeTask 上下文中解析所有待处理裁判数据。
+ *
+ * 函数排空当前静态队列，完成帧长和校验检查，更新完整协议快照，并把飞镖业务需要的
+ * 发射许可、窗口和闸门状态发布到主题总线。本函数不阻塞等待新数据。
+ */
+void referee_decode_pending(void);
+
+#endif /* DART_REFEREE_H */

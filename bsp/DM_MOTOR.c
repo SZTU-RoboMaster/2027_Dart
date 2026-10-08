@@ -1,16 +1,11 @@
-//
-// Created by liang on 2025-04-08.
-//
-
 #include "DM_MOTOR.h"
 #include "user_lib.h"
-#include "../application/Referee_system/Detection.h"
 #include "../application/Communication/can_receive.h"
 #include "bsp_can.h"
 #include "can.h"
 #include "../application/A_Dart/dart.h"
 
-// MIT¿ØÖÆÖ¡Ïà¹Ø³£Á¿¶¨Òå
+/* è¾¾å¦™ç”µæœºæ§åˆ¶åè®®å…è®¸çš„ç‰©ç†é‡èŒƒå›´ï¼Œç¼–ç å’Œè§£ç å¿…é¡»ä½¿ç”¨å®Œå…¨ç›¸åŒçš„ä¸Šä¸‹é™ã€‚ */
 #define P_MIN 0
 #define P_MAX 6.28
 #define V_MIN -45
@@ -22,30 +17,27 @@
 #define T_MIN -10
 #define T_MAX 10
 
-// ÄÚ²¿º¯ÊıÉùÃ÷
+/* åè®®å®šç‚¹æ•°ä¸æµ®ç‚¹ç‰©ç†é‡ä¹‹é—´çš„è½¬æ¢å‡½æ•°ã€‚ */
 static int fp32_to_uint(fp32 x, fp32 x_min, fp32 x_max, int bits);
 static fp32 uint_to_fp32(int x_int, fp32 x_min, fp32 x_max, int bits);
 
-// È«¾Ö±äÁ¿ÉùÃ÷
+/* æ°´å¹³è½´åé¦ˆå¯¹è±¡ä»¥åŠå‘é€å¸§å…±ç”¨çš„æš‚å­˜å¯¹è±¡ã€‚ */
 DM_Motor_t  YAW_Motor;
 DM_Motor_t  can_1;
 fp32 DM_Velocity;
 first_order_filter_type_t DM_Velocity_Filter;
 
-// DMµç»úÊ¹ÄÜ
+/* è¾¾å¦™ç”µæœºå‚å®¶åè®®è§„å®šçš„ä½¿èƒ½ã€å¤±èƒ½ã€ä¿å­˜é›¶ç‚¹å’Œæ¸…é”™å‘½ä»¤ã€‚ */
 uint8_t DM_Enable_CMD[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
-// DMµç»úÊ§ÄÜ
 uint8_t DM_Disable_CMD[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
-// DMµç»ú±£´æÁãµã
 uint8_t DM_Save_ZeroPoint_CMD[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE};
-// DMµç»úÇå´í
 uint8_t DM_Clear_Error_CMD[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB};
 
 /**
- * @brief ·¢ËÍDMµç»ú¿ØÖÆÃüÁî
- * @param[in] can_type      CANÍ¨µÀ
- * @param[in] motor_id  DMµç»úID
- * @param[in] cmd       Ö¸Áî
+ * @è¯´æ˜ å‘æŒ‡å®š CAN æ€»çº¿å‘é€ä¸€ç»„å…«å­—èŠ‚è¾¾å¦™ç‰¹æ®Šå‘½ä»¤ã€‚
+ * @å‚æ•° can_type ç›®æ ‡ç‰©ç†æ€»çº¿ã€‚
+ * @å‚æ•° motor_id ç›®æ ‡ç”µæœºæ§åˆ¶æ ‡è¯†ã€‚
+ * @å‚æ•° cmd å‚å®¶åè®®è§„å®šçš„å…«å­—èŠ‚å‘½ä»¤ã€‚
  */
 void DM_Send_CMD(CAN_TYPE can_type, can_msg_id_e motor_id, uint8_t *cmd) {
     if(can_type == CAN_1) {
@@ -56,12 +48,12 @@ void DM_Send_CMD(CAN_TYPE can_type, can_msg_id_e motor_id, uint8_t *cmd) {
 }
 
 /**
- * @brief ½«¸¡µãÊı×ª»»ÎªÎŞ·ûºÅÕûÊı
- * @param[in] x         Òª×ª»»µÄ¸¡µãÊı
- * @param[in] x_min     ×îĞ¡Öµ
- * @param[in] x_max     ×î´óÖµ
- * @param[in] bits      ÎŞ·ûºÅÕûÊıµÄÎ»¿í
- * @return              ×ª»»ºóµÄÎŞ·ûºÅÕûÊı
+ * @è¯´æ˜ æŠŠç»™å®šèŒƒå›´å†…çš„æµ®ç‚¹ç‰©ç†é‡çº¿æ€§æ˜ å°„ä¸ºæ— ç¬¦å·å®šç‚¹æ•´æ•°ã€‚
+ * @å‚æ•° x å¾…è½¬æ¢ç‰©ç†é‡ã€‚
+ * @å‚æ•° x_min ç‰©ç†é‡ä¸‹é™ã€‚
+ * @å‚æ•° x_max ç‰©ç†é‡ä¸Šé™ã€‚
+ * @å‚æ•° bits åè®®å­—æ®µä½æ•°ã€‚
+ * @è¿”å›å€¼ ç¼–ç åçš„æ— ç¬¦å·æ•´æ•°ã€‚
  */
 int fp32_to_uint(fp32 x, fp32 x_min, fp32 x_max, int bits) {
     fp32 span = x_max - x_min;
@@ -70,12 +62,12 @@ int fp32_to_uint(fp32 x, fp32 x_min, fp32 x_max, int bits) {
 }
 
 /**
- * @brief ½«ÎŞ·ûºÅÕûÊı×ª»»Îª¸¡µãÊı
- * @param x       Òª×ª»»µÄÎŞ·ûºÅÕûÊı
- * @param x_min   Ä¿±ê¸¡µãÊıµÄ×îĞ¡Öµ
- * @param x_max   Ä¿±ê¸¡µãÊıµÄ×î´óÖµ
- * @param bits    ÎŞ·ûºÅÕûÊıµÄÎ»¿í
- * @return        ×ª»»ºóµÄ¸¡µãÊı
+ * @è¯´æ˜ æŠŠåè®®æ— ç¬¦å·å®šç‚¹æ•´æ•°è¿˜åŸä¸ºæµ®ç‚¹ç‰©ç†é‡ã€‚
+ * @å‚æ•° x_int å¾…è½¬æ¢æ•´æ•°ã€‚
+ * @å‚æ•° x_min ç›®æ ‡ç‰©ç†é‡ä¸‹é™ã€‚
+ * @å‚æ•° x_max ç›®æ ‡ç‰©ç†é‡ä¸Šé™ã€‚
+ * @å‚æ•° bits åè®®å­—æ®µä½æ•°ã€‚
+ * @è¿”å›å€¼ è§£ç åçš„æµ®ç‚¹ç‰©ç†é‡ã€‚
  */
 
 fp32 uint_to_fp32(int x_int, fp32 x_min, fp32 x_max, int bits) {
@@ -85,14 +77,14 @@ fp32 uint_to_fp32(int x_int, fp32 x_min, fp32 x_max, int bits) {
 }
 
 /**
- * @brief  MITÄ£Ê½¿ØÏÂ¿ØÖÆÖ¡
- * @param  hcan   CANµÄ¾ä±ú
- * @param  ID     Êı¾İÖ¡µÄID
- * @param  _pos   Î»ÖÃ¸ø¶¨
- * @param  _vel   ËÙ¶È¸ø¶¨
- * @param  _KP    Î»ÖÃ±ÈÀıÏµÊı
- * @param  _KD    Î»ÖÃÎ¢·ÖÏµÊı
- * @param  _torq  ×ª¾Ø¸ø¶¨Öµ
+ * @è¯´æ˜ æŒ‰è¾¾å¦™ MIT æ¨¡å¼æ‰“åŒ…ä½ç½®ã€é€Ÿåº¦ã€åˆšåº¦ã€é˜»å°¼å’Œè½¬çŸ©æ§åˆ¶å¸§ã€‚
+ * @å‚æ•° can_type ç›®æ ‡ç‰©ç†æ€»çº¿ã€‚
+ * @å‚æ•° id ç›®æ ‡ç”µæœºæ§åˆ¶æ ‡è¯†ã€‚
+ * @å‚æ•° _pos ä½ç½®ç›®æ ‡ã€‚
+ * @å‚æ•° _vel é€Ÿåº¦ç›®æ ‡ã€‚
+ * @å‚æ•° _KP ä½ç½®æ¯”ä¾‹ç³»æ•°ã€‚
+ * @å‚æ•° _KD ä½ç½®å¾®åˆ†ç³»æ•°ã€‚
+ * @å‚æ•° _torq è½¬çŸ©ç›®æ ‡ã€‚
  */
 void DM_MIT_Ctrl_Motor(CAN_TYPE can_type, uint16_t id, fp32 _pos, fp32 _vel, fp32 _KP, fp32 _KD, fp32 _torq) {
     static CAN_TxHeaderTypeDef Tx_Header;
@@ -117,7 +109,7 @@ void DM_MIT_Ctrl_Motor(CAN_TYPE can_type, uint16_t id, fp32 _pos, fp32 _vel, fp3
     can_1.Tx_Data[6] = ((kd_tmp & 0xF) << 4) | (torq_tmp >> 8);
     can_1.Tx_Data[7] = torq_tmp;
 
-    // Ñ°ÕÒ¿ÕÓÊÏä²¢·¢ËÍÊı¾İ£¬»ù±¾ÉÏ¾ÍÊÇ°ÑÏÖÓĞµÄÓÊÏä¶¼·¢Ò»ÏÂ¿´¿´³É²»³É¹¦
+    /* ä¾æ¬¡å°è¯•ä¸‰ä¸ªç¡¬ä»¶å‘é€é‚®ç®±ï¼Œå‡å°‘é«˜é¢‘æ§åˆ¶æ—¶å› å•ä¸ªé‚®ç®±å ç”¨é€ æˆçš„ä¸¢å¸§ã€‚ */
     if(can_type == CAN_1){
         if(HAL_CAN_AddTxMessage(&hcan1, &Tx_Header, can_1.Tx_Data, (uint32_t *)CAN_TX_MAILBOX0) != HAL_OK) {
             if(HAL_CAN_AddTxMessage(&hcan1, &Tx_Header, can_1.Tx_Data, (uint32_t *)CAN_TX_MAILBOX1) != HAL_OK) {
@@ -136,11 +128,11 @@ void DM_MIT_Ctrl_Motor(CAN_TYPE can_type, uint16_t id, fp32 _pos, fp32 _vel, fp3
 
 int status;
 /**
- * @brief ½âÂëDMµç»úÊı¾İÖ¡
- * @param[in] motor     DMµç»úÊı¾İ½á¹¹ÌåÖ¸Õë
- * @param[in] hcan      CANÍ¨µÀ
- * @param[in] can_id    CANÊı¾İÖ¡ID
- * @param[in] data      CANÊı¾İÖ¡Êı¾İ
+ * @è¯´æ˜ è§£ç ä¸€å¸§è¾¾å¦™ç”µæœºåé¦ˆï¼Œå¹¶åœ¨ç”µæœºæœªä½¿èƒ½æ—¶è¯·æ±‚ä½¿èƒ½ã€‚
+ * @å‚æ•° motor æ¥æ”¶è§£ç ç»“æœçš„ç”µæœºå¯¹è±¡ã€‚
+ * @å‚æ•° hcan åé¦ˆæ¥è‡ªå“ªæ¡ç‰©ç†æ€»çº¿ã€‚
+ * @å‚æ•° can_id åé¦ˆå¸§æ ‡è¯†ã€‚
+ * @å‚æ•° data å…«å­—èŠ‚åé¦ˆæ•°æ®ã€‚
  */
 void DM_Motor_Decode(DM_Motor_t *motor, CAN_TYPE hcan, uint32_t can_id, uint8_t *data) {
      if(hcan == CAN_1) {
@@ -157,9 +149,7 @@ void DM_Motor_Decode(DM_Motor_t *motor, CAN_TYPE hcan, uint32_t can_id, uint8_t 
             motor->velocity = uint_to_fp32(motor->v_int, V_MIN, V_MAX, 12);
             motor->torque = uint_to_fp32(motor->t_int, T_MIN, T_MAX, 12);
 
-            //first_order_filter_cali(&DM_Velocity_Filter, YAW_Motor.velocity);
             DM_Velocity = DM_Velocity_Filter.out;
-            //detect_handle(DETECT_GIMBAL_DM_YAW);
         }
 
          if(CAN_DM6006_TURN == can_id) {
@@ -175,9 +165,7 @@ void DM_Motor_Decode(DM_Motor_t *motor, CAN_TYPE hcan, uint32_t can_id, uint8_t 
              motor->velocity = uint_to_fp32(motor->v_int, V_MIN, V_MAX, 12);
              motor->torque = uint_to_fp32(motor->t_int, T_MIN, T_MAX, 12);
 
-             //first_order_filter_cali(&DM_Velocity_Filter, YAW_Motor.velocity);
              DM_Velocity = DM_Velocity_Filter.out;
-             //detect_handle(DETECT_GIMBAL_DM_YAW);
          }
     }
 }

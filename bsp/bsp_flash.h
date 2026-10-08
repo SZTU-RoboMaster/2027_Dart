@@ -1,139 +1,71 @@
 #ifndef BSP_FLASH_H
 #define BSP_FLASH_H
+
 #include <stdint.h>
 
 #include "../application/A_Dart/struct_typedef.h"
 
-/* Base address of the Flash sectors */
-#define ADDR_FLASH_SECTOR_0 ((uint32_t)0x08000000)  /* Base address of Sector 0, 16 Kbytes   */
-#define ADDR_FLASH_SECTOR_1 ((uint32_t)0x08004000)  /* Base address of Sector 1, 16 Kbytes   */
-#define ADDR_FLASH_SECTOR_2 ((uint32_t)0x08008000)  /* Base address of Sector 2, 16 Kbytes   */
-#define ADDR_FLASH_SECTOR_3 ((uint32_t)0x0800C000)  /* Base address of Sector 3, 16 Kbytes   */
-#define ADDR_FLASH_SECTOR_4 ((uint32_t)0x08010000)  /* Base address of Sector 4, 64 Kbytes   */
-#define ADDR_FLASH_SECTOR_5 ((uint32_t)0x08020000)  /* Base address of Sector 5, 128 Kbytes  */
-#define ADDR_FLASH_SECTOR_6 ((uint32_t)0x08040000)  /* Base address of Sector 6, 128 Kbytes  */
-#define ADDR_FLASH_SECTOR_7 ((uint32_t)0x08060000)  /* Base address of Sector 7, 128 Kbytes  */
-#define ADDR_FLASH_SECTOR_8 ((uint32_t)0x08080000)  /* Base address of Sector 8, 128 Kbytes  */
-#define ADDR_FLASH_SECTOR_9 ((uint32_t)0x080A0000)  /* Base address of Sector 9, 128 Kbytes  */
-#define ADDR_FLASH_SECTOR_10 ((uint32_t)0x080C0000) /* Base address of Sector 10, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_11 ((uint32_t)0x080E0000) /* Base address of Sector 11, 128 Kbytes */
+/*
+ * STM32F427 双存储体扇区起始地址。
+ * 当前参数区固定使用第一存储体第十一扇区；链接脚本必须同时把该扇区排除在程序区外。
+ */
+#define ADDR_FLASH_SECTOR_0  ((uint32_t)0x08000000) /* 第零扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_1  ((uint32_t)0x08004000) /* 第一扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_2  ((uint32_t)0x08008000) /* 第二扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_3  ((uint32_t)0x0800C000) /* 第三扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_4  ((uint32_t)0x08010000) /* 第四扇区，六十四千字节。 */
+#define ADDR_FLASH_SECTOR_5  ((uint32_t)0x08020000) /* 第五扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_6  ((uint32_t)0x08040000) /* 第六扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_7  ((uint32_t)0x08060000) /* 第七扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_8  ((uint32_t)0x08080000) /* 第八扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_9  ((uint32_t)0x080A0000) /* 第九扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_10 ((uint32_t)0x080C0000) /* 第十扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_11 ((uint32_t)0x080E0000) /* 第十一扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_12 ((uint32_t)0x08100000) /* 第十二扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_13 ((uint32_t)0x08104000) /* 第十三扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_14 ((uint32_t)0x08108000) /* 第十四扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_15 ((uint32_t)0x0810C000) /* 第十五扇区，十六千字节。 */
+#define ADDR_FLASH_SECTOR_16 ((uint32_t)0x08110000) /* 第十六扇区，六十四千字节。 */
+#define ADDR_FLASH_SECTOR_17 ((uint32_t)0x08120000) /* 第十七扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_18 ((uint32_t)0x08140000) /* 第十八扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_19 ((uint32_t)0x08160000) /* 第十九扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_20 ((uint32_t)0x08180000) /* 第二十扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_21 ((uint32_t)0x081A0000) /* 第二十一扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_22 ((uint32_t)0x081C0000) /* 第二十二扇区，一百二十八千字节。 */
+#define ADDR_FLASH_SECTOR_23 ((uint32_t)0x081E0000) /* 第二十三扇区，一百二十八千字节。 */
 
-//#define FLASH_END_ADDR ((uint32_t)0x08100000)       /* Base address of Sector 23, 128 Kbytes */
+#define FLASH_USER_START_ADDR 0x080E0000U /* 飞镖参数块固定起始地址。 */
+#define FLASH_END_ADDR        0x081FFFFFU /* 芯片内部存储器末地址。 */
 
+/* 在不违反严格别名规则的情况下查看浮点数的原始三十二位表示。 */
+typedef union {
+    float floatValue;
+    uint32_t uintValue;
+} float_to_uint32;
 
-#define ADDR_FLASH_SECTOR_12 ((uint32_t)0x08100000) /* Base address of Sector 12, 16 Kbytes  */
-#define ADDR_FLASH_SECTOR_13 ((uint32_t)0x08104000) /* Base address of Sector 13, 16 Kbytes  */
-#define ADDR_FLASH_SECTOR_14 ((uint32_t)0x08108000) /* Base address of Sector 14, 16 Kbytes  */
-#define ADDR_FLASH_SECTOR_15 ((uint32_t)0x0810C000) /* Base address of Sector 15, 16 Kbytes  */
-#define ADDR_FLASH_SECTOR_16 ((uint32_t)0x08110000) /* Base address of Sector 16, 64 Kbytes  */
-#define ADDR_FLASH_SECTOR_17 ((uint32_t)0x08120000) /* Base address of Sector 17, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_18 ((uint32_t)0x08140000) /* Base address of Sector 18, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_19 ((uint32_t)0x08160000) /* Base address of Sector 19, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_20 ((uint32_t)0x08180000) /* Base address of Sector 20, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_21 ((uint32_t)0x081A0000) /* Base address of Sector 21, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_22 ((uint32_t)0x081C0000) /* Base address of Sector 22, 128 Kbytes */
-#define ADDR_FLASH_SECTOR_23 ((uint32_t)0x081E0000) /* Base address of Sector 23, 128 Kbytes */
+/* 以下两个接口是旧浮点数组存储兼容层，新参数系统不应继续使用。 */
+void Flash_Write_Data(float *data, uint32_t length);
+void Flash_Read_Data(float *data, uint32_t length);
 
-#define FLASH_USER_START_ADDR    0x080E0000
-#define FLASH_END_ADDR           0x081FFFFF
+/* 从指定地址开始擦除连续扇区。 */
+void flash_erase_address(uint32_t address, uint16_t sector_count);
 
-typedef union
-{
-  float floatValue;
-  uint32_t uintValue;
-}float_to_uint32;
+/* 在当前地址所属扇区内写入若干个三十二位字，成功返回零。 */
+int8_t flash_write_single_address(uint32_t start_address, uint32_t *data, uint32_t word_count);
 
+/* 在显式地址范围内写入若干个三十二位字，成功返回零。 */
+int8_t flash_write_muli_address(uint32_t start_address,
+                                uint32_t end_address,
+                                uint32_t *data,
+                                uint32_t word_count);
 
-void Flash_Write_Data(float *Data,uint32_t DataLength);
+/* 从存储器映射地址读取若干个三十二位字。 */
+void flash_read(uint32_t address, uint32_t *data, uint32_t word_count);
 
-void Flash_Read_Data(float *pData,uint32_t DataLength);
-/**
-  * @brief          erase flash
-  * @param[in]      address: flash address
-  * @param[in]      len: page num
-  * @retval         none
-  */
-/**
-  * @brief          ����flash
-  * @param[in]      address: flash ��ַ
-  * @param[in]      len: ҳ����
-  * @retval         none
-  */
-extern void flash_erase_address(uint32_t address, uint16_t len);
+/* 把存储器地址换算成硬件抽象层使用的扇区编号。 */
+uint32_t ger_sector(uint32_t address);
 
-/**
-  * @brief          write data to one page of flash
-  * @param[in]      start_address: flash address
-  * @param[in]      buf: data point
-  * @param[in]      len: data num
-  * @retval         success 0, fail -1
-  */
-/**
-  * @brief          ��һҳflashд����
-  * @param[in]      start_address: flash ��ַ
-  * @param[in]      buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         success 0, fail -1
-  */
-extern int8_t flash_write_single_address(uint32_t start_address, uint32_t *buf, uint32_t len);
+/* 返回当前扇区之后的第一个地址，用作单扇区写入上界。 */
+uint32_t get_next_flash_address(uint32_t address);
 
-
-/**
-  * @brief          write data to some pages of flash
-  * @param[in]      start_address: flash start address
-  * @param[in]      end_address: flash end address
-  * @param[in]      buf: data point
-  * @param[in]      len: data num
-  * @retval         success 0, fail -1
-  */
-/**
-  * @brief          ����ҳflashд����
-  * @param[in]      start_address: flash ��ʼ��ַ
-  * @param[in]      end_address: flash ������ַ
-  * @param[in]      buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         success 0, fail -1
-  */
-extern int8_t flash_write_muli_address(uint32_t start_address, uint32_t end_address, uint32_t *buf, uint32_t len);
-
-/**
-  * @brief          read data for flash
-  * @param[in]      address: flash address
-  * @param[out]     buf: data point
-  * @param[in]      len: data num
-  * @retval         none
-  */
-/**
-  * @brief          ��flash������
-  * @param[in]      start_address: flash ��ַ
-  * @param[out]     buf: ����ָ��
-  * @param[in]      len: ���ݳ���
-  * @retval         none
-  */
-extern void flash_read(uint32_t address, uint32_t *buf, uint32_t len);
-
-/**
-  * @brief          get the sector number of flash
-  * @param[in]      address: flash address
-  * @retval         sector number
-  */
-/**
-  * @brief          ��ȡflash��sector��
-  * @param[in]      address: flash ��ַ
-  * @retval         sector��
-  */
-extern uint32_t ger_sector(uint32_t address);
-/**
-  * @brief          get the next page flash address
-  * @param[in]      address: flash address
-  * @retval         next page flash address
-  */
-/**
-  * @brief          ��ȡ��һҳflash��ַ
-  * @param[in]      address: flash ��ַ
-  * @retval         ��һҳflash��ַ
-  */
-extern uint32_t get_next_flash_address(uint32_t address);
-
-
-#endif
+#endif /* BSP_FLASH_H */

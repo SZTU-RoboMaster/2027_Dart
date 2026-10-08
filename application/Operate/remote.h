@@ -1,7 +1,3 @@
-//
-// Created by xhuanc on 2021/10/11.
-//
-
 #ifndef _REMOTE_H_
 #define _REMOTE_H_
 
@@ -17,7 +13,7 @@
 #define RC_CH_VALUE_OFFSET      ((uint16_t)1024)
 #define RC_CH_VALUE_MAX         ((uint16_t)1684)
 
-/* ----------------------- RC Switch Definition----------------------------- */
+/* DBUS 三段拨杆编码；注意数组下标与物理左右拨杆映射。 */
 #define RC_SW_UP                ((uint16_t)1)
 #define RC_SW_MID               ((uint16_t)3)
 #define RC_SW_DOWN              ((uint16_t)2)
@@ -26,7 +22,7 @@
 #define switch_is_up(s)         (s == RC_SW_UP)
 #define RC_s_R 0
 #define RC_s_L 1
-/* ----------------------- PC Key Definition-------------------------------- */
+/* 键盘按键位定义：每一位对应遥控器透传键盘数据中的一个按键。 */
 #define KEY_W            ((uint16_t)1 << 0)
 #define KEY_S            ((uint16_t)1 << 1)
 #define KEY_A            ((uint16_t)1 << 2)
@@ -43,10 +39,13 @@
 #define KEY_C            ((uint16_t)1 << 13)
 #define KEY_V            ((uint16_t)1 << 14)
 #define KEY_B            ((uint16_t)1 << 15)
-/* ----------------------- Mouse Key Definition-------------------------------- */
+/* 鼠标按键状态定义。 */
 #define MOUSE_YES 1
 #define MOUSE_NO 0
-/* ----------------------- Data Struct ------------------------------------- */
+/*
+ * 完整 18 字节 DBUS 解码结果。
+ * __packed 保留历史布局；DartTask 只读取 rc.ch、rc.s 和拨轮 ch[4]。
+ */
 typedef  struct
 {
     __packed struct
@@ -71,12 +70,10 @@ typedef  struct
 
 }__packed RC_ctrl_t;
 
-/* ----------------------- Internal Data ----------------------------------- */
-
-extern void remote_control_init(void);
-//extern const RC_ctrl_t *get_remote_control_point(void);
-extern uint8_t RC_data_is_error(void);
-extern void slove_RC_lost(void);
-extern void slove_data_error(void);
-extern void sbus_to_usart1(uint8_t *sbus);
+/* 启动接收；由 main 在调度器启动前调用。 */
+void remote_control_init(void);
+/* 校验并在错误时把 rc_ctrl 置为安全值，0=有效，1=错误。 */
+uint8_t RC_data_is_error(void);
+/* 最近一帧有效 DBUS 数据的本地毫秒时间，用于 200 ms 离线判断。 */
+extern volatile uint32_t remote_last_update_ms;
 #endif

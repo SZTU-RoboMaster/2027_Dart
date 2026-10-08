@@ -1,92 +1,91 @@
-//
-// Created by Shockley on 2022/12/5.
-//
-#include "decode.h"
-#include "string.h"
-#include "stdio.h"
-#include "CRC8_CRC16.h"
-#include "../../application/A_Dart/protocol_shaob.h"
-#include "fifo.h"
-#include "cmsis_os.h"
 #include "packet.h"
-extern void append_CRC16_check_sum(uint8_t * pchMessage,uint32_t dwLength);
-/*
-** Descriptions: append CRC16 to the end of data
-** Input: Data to CRC and append,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
-extern void append_CRC16_check_sum(uint8_t * pchMessage,uint32_t dwLength);
-void encode_send_data(uint16_t cmd_id, void* buf, uint16_t len);
-/*
-** Descriptions: append CRC8 to the end of data
-** Input: Data to CRC and append,Stream length = Data + checksum
-** Output: True or False (CRC Verify Result)
-*/
-extern void append_CRC8_check_sum(unsigned char *pchMessage, unsigned int dwLength);
-//USB底层发送函数
-extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 
-//robot_ctrl_info_t robot_ctrl;
-chassis_odom_info_t chassis_odom;
-extern QueueHandle_t CDC_send_queue;
-msg_end_info msg_end;
-//把ID和消息内容塞进队列
-void rm_queue_data(uint16_t cmd_id,void* buf,uint16_t len ) //uint8_t queue_data[128];
+#include <string.h>
+
+#include "CRC8_CRC16.h"
+#include "usb_task.h"
+#include "../../application/A_Dart/protocol_shaob.h"
+
+/*
+ * USB 协议序列化器
+ * =================
+ *
+ * 输出布局：
+ *   [5 字节帧头(含 CRC8)] [2 字节命令 ID] [N 字节负载]
+ *   [2 字节 CRC16] [0x0D 0x0A]
+ *
+ * 本模块只构造一帧并复制到 UsbTask 静态队列，不直接调用 CDC 驱动。因此多个业务
+ * 调用者不会并发操作 USB 端点，实际发送长度也随队列元素一起保存。
+ */
+
+/**
+ * @brief 按机器人通信协议封装一帧数据并提交给 UsbTask。
+ *
+ * 本函数依次生成帧头、CRC8、命令字、负载、CRC16 和帧尾，然后把实际帧长连同数据
+ * 一起复制到静态 USB 发送队列。函数不会直接访问 USB CDC 端点，因此调用者不会和
+ * UsbTask 发生端点并发。非法长度或队列拥塞时直接放弃当前帧。
+ *
+ * @param command_id 协议命令字，按现有协议的小端格式写入。
+ * @param payload 待发送负载的首地址，必须与 `payload_length` 对应。
+ * @param payload_length 负载字节数，不包含帧头、命令字、校验和帧尾。
+ */
+static void encode_and_enqueue(uint16_t command_id,
+                               const void *payload,
+                               uint16_t payload_length)
 {
-    uint16_t index = 0;
-    uint8_t queue_data[128];
-    memcpy(queue_data,  (void*)&cmd_id, sizeof(uint16_t));
-    index +=sizeof(uint16_t);
-    memcpy(queue_data + index, (void*)buf, len);
-    index += len;
-    xQueueSend(CDC_send_queue, queue_data, 50);
-}
-//把ID和消息内容从队列中取出来
-void rm_dequeue_send_data(void* buf,uint16_t len)//auto run
-{
-    uint16_t cmd_id;
-    memcpy(&cmd_id,buf,sizeof(uint16_t));
-    switch(cmd_id)
-    {
-        case CHASSIS_ODOM_CMD_ID:  //需要发送的数据包ID号
-            encode_send_data(CHASSIS_ODOM_CMD_ID,((uint8_t*)buf+2),sizeof(chassis_odom_info_t));
-            break;
-        case CHASSIS_CTRL_CMD_ID:
-            encode_send_data(CHASSIS_CTRL_CMD_ID,((uint8_t*)buf+2),sizeof(robot_ctrl_info_t ));
-            break;
-        case VISION_ID:
-            encode_send_data(VISION_ID,((uint8_t*)buf+2),sizeof(vision_t));
-            break;
+    /* 最大长度同时考虑协议开销和 UsbTask 单帧存储上限。 */
+    const uint16_t protocol_overhead =
+        (uint16_t)(REF_HEADER_CRC_CMDID_LEN + sizeof(msg_end_info));
+    if (payload == NULL || payload_length > (USB_TX_MAX_FRAME_SIZE - protocol_overhead)) {
+        return;
     }
-}
-//实现RM协议的序列化过程
-void encode_send_data(uint16_t cmd_id,void* buf ,uint16_t len)
-{
-    msg_end.end1=END1_SOF;
-    msg_end.end2=END2_SOF;
-    static uint8_t send_buf[128];  //定义128字节大小缓存数组
-    uint16_t index=0;
-    frame_header_struct_t referee_send_header;  //定义帧头结构体
-    //初始化帧头结构体
-    referee_send_header.SOF = HEADER_SOF;
-    referee_send_header.data_length = len;
-    referee_send_header.seq++;
-    //生成CRC8校验
-    append_CRC8_check_sum((uint8_t*)&referee_send_header, sizeof(frame_header_struct_t));
-    memcpy(send_buf, (uint8_t*)&referee_send_header, sizeof(frame_header_struct_t));
-    index += sizeof(frame_header_struct_t);
-    //填充ID
-    memcpy(send_buf + index, (void*)&cmd_id, sizeof(uint16_t));
-    index += sizeof(uint16_t);
-    //填充数据包
-    memcpy(send_buf + index, (void*)buf, len);
-    index += len;
-    //生成CRC16校验
-    append_CRC16_check_sum(send_buf, REF_HEADER_CRC_CMDID_LEN + len);
-    index += sizeof(uint16_t);
 
-    memcpy(send_buf + index,(void*)&msg_end,sizeof(msg_end_info));
-    index += sizeof(msg_end_info);
-    //调用底层发送函数
-    CDC_Transmit_FS(send_buf, index);
+    uint8_t frame[USB_TX_MAX_FRAME_SIZE] = {0};
+    uint16_t index = 0U;
+    static uint8_t sequence;
+
+    /* 帧头必须按 1 字节对齐协议结构生成，CRC8 覆盖整个固定帧头。 */
+    frame_header_struct_t header = {
+        .SOF = HEADER_SOF,
+        .data_length = payload_length,
+        .seq = sequence++,
+    };
+    append_CRC8_check_sum((uint8_t *)&header, sizeof(header));
+    memcpy(frame + index, &header, sizeof(header));
+    index += (uint16_t)sizeof(header);
+
+    /* uint16_t 命令字按协议原有小端格式复制，避免未对齐写入。 */
+    memcpy(frame + index, &command_id, sizeof(command_id));
+    index += (uint16_t)sizeof(command_id);
+
+    memcpy(frame + index, payload, payload_length);
+    index += payload_length;
+
+    /* append 函数把最后两个预留字节写为 CRC16。 */
+    const uint16_t crc_frame_length =
+        (uint16_t)(REF_HEADER_CRC_CMDID_LEN + payload_length);
+    append_CRC16_check_sum(frame, crc_frame_length);
+    index += (uint16_t)sizeof(uint16_t);
+
+    const msg_end_info end_marker = { .end1 = END1_SOF, .end2 = END2_SOF };
+    memcpy(frame + index, &end_marker, sizeof(end_marker));
+    index += (uint16_t)sizeof(end_marker);
+
+    /* 50 ms 是队列拥塞上限；队列满时丢弃本帧，不阻塞控制任务。 */
+    (void)usb_tx_enqueue(frame, index, 50U);
+}
+
+/**
+ * @brief 向统一 USB 发送通道提交一条协议消息。
+ *
+ * 该函数保留原工程的调用名称，内部已经改为“封装后入队”的非直接发送方式。它不保证
+ * 数据在返回前已经上总线；UsbTask 会在 USB 空闲时依次发送队列中的完整帧。
+ *
+ * @param command_id 协议命令字。
+ * @param buffer 待发送负载地址；为空时本次请求被忽略。
+ * @param length 负载字节数，超过单帧容量时本次请求被忽略。
+ */
+void rm_queue_data(uint16_t command_id, const void *buffer, uint16_t length)
+{
+    encode_and_enqueue(command_id, buffer, length);
 }

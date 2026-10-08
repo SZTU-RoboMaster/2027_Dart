@@ -47,7 +47,9 @@ MEMORY
 {
   CCMRAM    (xrw)    : ORIGIN = 0x10000000,   LENGTH = 64K
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 192K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 2048K
+  /* Bank 1 sector 11 is reserved for dart_parameters_t. */
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 896K
+  PARAM    (rx)    : ORIGIN = 0x80E0000,   LENGTH = 128K
 }
 
 /* Sections */
