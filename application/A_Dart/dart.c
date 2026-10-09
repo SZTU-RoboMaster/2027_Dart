@@ -186,7 +186,6 @@ Dart_Ready_Manage_t dart_ready_manage=
 
 /*      滤波      */
 first_order_filter_type_t filter_yaw_in;
-float trigger_distance_set[4] = {0, 0, 0, 0};
 void dart_task(void const*pvParameters)
 {
     vTaskDelay(DART_TASK_INIT_TIME);
